@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>钢筋空间拓扑与机器人施工规划系统</title>
+  <link rel="stylesheet" href="/static/styles.css?v=1.2.0">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">IFC · TOPOLOGY · ROBOTICS</div>
+      <h1>钢筋空间拓扑与机器人施工规划系统</h1>
+      <p>多方向空间拓扑、Excel 人工顺序、六自由度安装碰撞检查与机器人轨迹输出</p>
+    </div>
+    <div class="health" id="healthBadge">服务检查中</div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <section class="panel upload-panel">
+        <div class="section-title">
+          <span>01</span>
+          <div><h2>创建规划任务</h2><p>上传 IFC 并设置工程参数</p></div>
+        </div>
+        <label class="dropzone" id="dropzone">
+          <input id="fileInput" type="file" accept=".ifc,.ifczip">
+          <strong id="fileLabel">拖入 IFC 文件或点击选择</strong>
+          <small>支持 IFC2X3 / IFC4，最大 500 MB</small>
+        </label>
+        <label class="select-row">安装顺序来源
+          <select id="sequenceSource">
+            <option value="automatic" selected>自动多方向空间拓扑</option>
+            <option value="excel">Excel 人工顺序</option>
+          </select>
+        </label>
+        <div id="sequenceUpload" class="sequence-upload hidden">
+          <label class="sequence-file">
+            <input id="sequenceFile" type="file" accept=".xlsx,.csv,.tsv">
+            <span id="sequenceFileLabel">选择安装顺序表</span>
+          </label>
+          <a href="/api/templates/installation-sequence">下载 Excel 模板</a>
+          <small>简表只需一列 name，填 BIM 编号（如 640520），行顺序即安装顺序。</small>
+        </div>
+        <div class="sequence-generator">
+          <button id="generateSequenceBtn" type="button" disabled>根据当前 IFC 生成人工顺序 Excel</button>
+          <small>选择 IFC 后，可下载可编辑的顺序表；调整 name 列行顺序后再用于人工规划。</small>
+        </div>
+        <div class="form-grid">
+          <label>安全间隙 / mm<input id="clearance" type="number" value="1.0" step="0.5"></label>
+          <label>轴线简化 / mm<input id="simplify" type="number" value="0.75" step="0.25"></label>
+          <label>碰撞平移步长 / mm<input id="collisionTranslation" type="number" value="75" step="5"></label>
+          <label>碰撞旋转步长 / °<input id="collisionRotation" type="number" value="7.5" step="0.5"></label>
+          <label>直线速度 / mm·s⁻¹<input id="linearSpeed" type="number" value="600"></label>
+          <label>采样周期 / s<input id="samplePeriod" type="number" value="0.10" step="0.01"></label>
+        </div>
+        <label class="check-row"><input id="assemblyEnabled" type="checkbox" checked> 六自由度安装路径搜索与碰撞检查</label>
+        <label class="check-row"><input id="robotEnabled" type="checkbox" checked> 为检查通过的路径生成机器人 TCP 轨迹</label>
+        <button class="primary" id="submitBtn" type="button">上传并开始计算</button>
+        <div class="upload-note" id="uploadNote"></div>
+      </section>
+
+      <section class="panel task-panel">
+        <div class="section-title compact">
+          <span>02</span>
+          <div><h2>计算任务</h2><p>后台独立进程与实时进度</p></div>
+        </div>
+        <div id="taskList" class="task-list"></div>
+      </section>
+    </aside>
+
+    <section class="workspace">
+      <section class="metrics" id="metrics">
+        <div class="metric"><span>钢筋数量</span><strong id="metricBars">—</strong></div>
+        <div class="metric"><span>几何类型</span><strong id="metricTypes">—</strong></div>
+        <div class="metric"><span>轴线总长</span><strong id="metricLength">—</strong></div>
+        <div class="metric"><span>六自由度校核</span><strong id="metricFeasible">—</strong></div>
+      </section>
+
+      <section class="viewer-panel">
+        <div class="viewer-head">
+          <div>
+            <div class="eyebrow">WEB 3D ASSEMBLY PLAYER</div>
+            <h2>钢筋六自由度安装动画</h2>
+          </div>
+          <div class="viewer-actions">
+            <button id="fitBtn" type="button">适配视图</button>
+            <label class="check-row small"><input id="ghostToggle" type="checkbox" checked> 最终模型</label>
+            <label class="check-row small"><input id="robotToggle" type="checkbox" checked> 机器人路径</label>
+          </div>
+        </div>
+        <div class="canvas-wrap">
+          <canvas id="viewerCanvas"></canvas>
+          <div class="empty-state" id="emptyState">
+            <div class="cube-icon">◇</div>
+            <h3>等待模型结果</h3>
+            <p>完成计算后将在此显示可旋转、缩放和逐步播放的三维安装过程。</p>
+          </div>
+          <div class="viewer-overlay top-left" id="viewerInfo">未加载任务</div>
+          <div class="viewer-overlay top-right">拖动旋转 · 滚轮缩放 · 双击适配</div>
+        </div>
+        <div class="player">
+          <button id="prevBtn" type="button">◀</button>
+          <button id="playBtn" type="button" class="primary small-btn">播放</button>
+          <button id="nextBtn" type="button">▶</button>
+          <input id="stepSlider" type="range" min="0" max="1" value="0">
+          <span id="stepText">0 / 0</span>
+          <label>速度<select id="speedSelect"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="5">5×</option><option value="10">10×</option></select></label>
+        </div>
+      </section>
+
+      <section class="bottom-grid">
+        <section class="panel status-panel">
+          <div class="section-title compact">
+            <span>03</span>
+            <div><h2>任务状态与结果</h2><p>阶段、日志与文件下载</p></div>
+          </div>
+          <div class="progress-block">
+            <div class="progress-line"><strong id="stageLabel">未选择任务</strong><span id="progressLabel">0%</span></div>
+            <div class="progress-track"><div id="progressBar"></div></div>
+            <p id="statusMessage">请先上传 IFC 模型。</p>
+          </div>
+          <div id="downloads" class="downloads"></div>
+        </section>
+
+        <section class="panel robot-panel">
+          <div class="section-title compact">
+            <span>04</span>
+            <div><h2>机器人轨迹重生成</h2><p>调整运动参数后重新导出</p></div>
+          </div>
+          <div class="form-grid">
+            <label>线速度 / mm·s⁻¹<input id="regenLinear" type="number" value="600"></label>
+            <label>角速度 / °·s⁻¹<input id="regenAngular" type="number" value="45"></label>
+            <label>模型外等待距离 / mm<input id="regenMargin" type="number" value="800"></label>
+            <label>预插入距离 / mm<input id="regenPre" type="number" value="250"></label>
+          </div>
+          <button id="regenBtn" type="button" disabled>重新生成机器人轨迹</button>
+          <p class="engineering-note">仅对六自由度钢筋路径检查通过的步骤导出 TCP 位姿。钢筋碰撞已校核，机器人本体、夹具、关节限位和现场障碍仍需在离线仿真中复核。</p>
+        </section>
+      </section>
+    </section>
+  </main>
+
+  <footer>
+    <span>FastAPI 后台计算服务</span><span>浏览器自包含三维线框渲染器</span><span>ABB · KUKA · UR · CSV</span>
+  </footer>
+  <script src="/static/app.js?v=1.2.0"></script>
+</body>
+</html>

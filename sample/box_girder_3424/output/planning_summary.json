@@ -1,0 +1,68 @@
+{
+  "ifc_schema": "IFC2X3",
+  "entity_count": 391535,
+  "representation_map_count": 170,
+  "axis_type_count": 169,
+  "map_failure_count": 1,
+  "map_failures": {
+    "72612": "No supported body geometry for map #72612"
+  },
+  "rebar_count": 3424,
+  "type_count": 169,
+  "axis_total_length_m": 9831.489253930504,
+  "diameter_mm": {
+    "min": 8.0,
+    "median": 12.0,
+    "max": 20.000000000000007
+  },
+  "bbox_mm": {
+    "min": [
+      -16296.0,
+      -3512.000000000662,
+      -451.37933581935806
+    ],
+    "max": [
+      16296.0,
+      3512.000000000662,
+      -7.370309639196421
+    ]
+  },
+  "planner": {
+    "planner_mode": "fast_monotone_layer",
+    "candidate_axes": [
+      "Z"
+    ],
+    "layer_quantum_mm": 1.5,
+    "layer_count": 93,
+    "initial_core_size": 0,
+    "forced_core_steps": 0,
+    "strict_graph_feasible": true,
+    "certification_scope": "capsule-axis z-monotone height-envelope abstraction",
+    "complexity": "O(n log n)"
+  },
+  "output_files": [
+    "rebar_axes.json",
+    "installation_sequence.csv",
+    "viewer_model.json"
+  ],
+  "robot": {
+    "bar_count": 3424,
+    "tcp_sample_count": 96293,
+    "nominal_duration_s": 8873.057611824415,
+    "task_space_only": true,
+    "joint_trajectory_requires": [
+      "robot URDF",
+      "base frame",
+      "workpiece frame",
+      "TCP",
+      "joint seed and limits"
+    ],
+    "files": [
+      "tcp_trajectory.csv",
+      "robot_waypoints.json",
+      "rebar_install.mod",
+      "rebar_install.src",
+      "rebar_install.script"
+    ]
+  }
+}

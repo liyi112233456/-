@@ -1,0 +1,13 @@
+services:
+  rebar-system:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    environment:
+      REBAR_DATA_DIR: /data
+      REBAR_MAX_UPLOAD_MB: 500
+    volumes:
+      - rebar-data:/data
+    restart: unless-stopped
+volumes:
+  rebar-data:

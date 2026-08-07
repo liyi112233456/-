@@ -1,0 +1,20 @@
+{
+  "bar_count": 3424,
+  "tcp_sample_count": 96293,
+  "nominal_duration_s": 8873.057611824415,
+  "task_space_only": true,
+  "joint_trajectory_requires": [
+    "robot URDF",
+    "base frame",
+    "workpiece frame",
+    "TCP",
+    "joint seed and limits"
+  ],
+  "files": [
+    "tcp_trajectory.csv",
+    "robot_waypoints.json",
+    "rebar_install.mod",
+    "rebar_install.src",
+    "rebar_install.script"
+  ]
+}

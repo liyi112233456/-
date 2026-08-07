@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.env
+
+# Runtime database and generated job data
+backend/data/tasks.sqlite3
+backend/data/jobs/*
+!backend/data/jobs/.gitkeep
+
+# Local exports, inspection files, and uploaded BIM models
+outputs/*
+*.inspect.ndjson
+*.ifc
+*.ifczip
+
+# Local test exports
+actual_ifc_sequence_test.xlsx
+generated_sequence_test.xlsx
