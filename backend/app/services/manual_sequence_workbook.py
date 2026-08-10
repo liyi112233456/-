@@ -5,8 +5,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from openpyxl import Workbook
+from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 
 from .ifc_geometry import Rebar
 
@@ -15,6 +17,8 @@ GROUP_BOTTOM = "底板"
 GROUP_WEB = "腹板"
 GROUP_TOP = "顶板"
 GROUP_ORDER = {GROUP_BOTTOM: 0, GROUP_WEB: 1, GROUP_TOP: 2}
+STATUS_PENDING = "待安装"
+STATUS_PREINSTALLED = "已安装"
 
 _HEADER_FILL = PatternFill("solid", fgColor="1F4E79")
 _SECONDARY_FILL = PatternFill("solid", fgColor="5B6770")
@@ -22,6 +26,8 @@ _BODY_FILL = PatternFill("solid", fgColor="F7FAFC")
 _BOTTOM_FILL = PatternFill("solid", fgColor="E8F1FB")
 _WEB_FILL = PatternFill("solid", fgColor="FFF4E5")
 _TOP_FILL = PatternFill("solid", fgColor="EAF6EA")
+_PENDING_FILL = PatternFill("solid", fgColor="FFF4CC")
+_PREINSTALLED_FILL = PatternFill("solid", fgColor="D9EAD3")
 _LABEL_FILL = PatternFill("solid", fgColor="EAF3F8")
 _WHITE_FONT = Font(bold=True, color="FFFFFF")
 _BOLD_FONT = Font(bold=True)
@@ -71,6 +77,7 @@ def _classify_groups(rebars: Iterable[Rebar]) -> tuple[list[dict[str, Any]], dic
         records.append(
             {
                 "name": _name_identifier(bar),
+                "installation_status": STATUS_PENDING,
                 "construction_group": group,
                 "model_name": bar.name,
                 "model_bar_index": bar.index,
@@ -149,6 +156,7 @@ def build_manual_sequence_workbook(
 
     headers = [
         "name",
+        "installation_status",
         "construction_group",
         "model_name",
         "model_bar_index",
@@ -165,30 +173,53 @@ def build_manual_sequence_workbook(
     _style_header(sequence[1])
     if records:
         _style_body(sequence, 2, len(records) + 1, 1, len(headers))
-    sequence.auto_filter.ref = f"A1:J{len(records) + 1}"
+    sequence.auto_filter.ref = f"A1:K{len(records) + 1}"
     sequence.sheet_properties.pageSetUpPr.fitToPage = True
     sequence.page_setup.fitToWidth = 1
     sequence.page_setup.fitToHeight = 0
     sequence.column_dimensions["A"].width = 16
     sequence.column_dimensions["B"].width = 16
-    sequence.column_dimensions["C"].width = 46
-    sequence.column_dimensions["D"].width = 16
+    sequence.column_dimensions["C"].width = 16
+    sequence.column_dimensions["D"].width = 46
     sequence.column_dimensions["E"].width = 16
-    sequence.column_dimensions["F"].width = 14
+    sequence.column_dimensions["F"].width = 16
     sequence.column_dimensions["G"].width = 14
-    sequence.column_dimensions["H"].width = 12
+    sequence.column_dimensions["H"].width = 14
     sequence.column_dimensions["I"].width = 12
-    sequence.column_dimensions["J"].width = 34
+    sequence.column_dimensions["J"].width = 12
+    sequence.column_dimensions["K"].width = 34
     sequence.row_dimensions[1].height = 30
     for row in range(2, len(records) + 2):
         sequence.cell(row, 1).number_format = "@"
-        sequence.cell(row, 6).number_format = "@"
-        sequence.cell(row, 7).number_format = "0.0"
+        sequence.cell(row, 7).number_format = "@"
         sequence.cell(row, 8).number_format = "0.0"
+        sequence.cell(row, 9).number_format = "0.0"
         sequence.cell(row, 1).alignment = Alignment(horizontal="center", vertical="center")
         sequence.cell(row, 2).alignment = Alignment(horizontal="center", vertical="center")
-        for col in (4, 5, 7, 8):
+        sequence.cell(row, 3).alignment = Alignment(horizontal="center", vertical="center")
+        sequence.cell(row, 2).fill = _PENDING_FILL
+        for col in (5, 6, 8, 9):
             sequence.cell(row, col).alignment = Alignment(horizontal="right", vertical="center")
+    if records:
+        status_validation = DataValidation(
+            type="list", formula1=f'"{STATUS_PENDING},{STATUS_PREINSTALLED}"', allow_blank=True
+        )
+        status_validation.error = f"请选择{STATUS_PENDING}或{STATUS_PREINSTALLED}"
+        status_validation.errorTitle = "安装状态无效"
+        status_validation.prompt = f"{STATUS_PREINSTALLED}的钢筋不模拟安装，但作为后续碰撞障碍。"
+        status_validation.promptTitle = "选择安装状态"
+        status_validation.showErrorMessage = True
+        status_validation.showInputMessage = True
+        sequence.add_data_validation(status_validation)
+        status_validation.add(f"B2:B{len(records) + 1}")
+        sequence.conditional_formatting.add(
+            f"B2:B{len(records) + 1}",
+            FormulaRule(formula=[f'$B2="{STATUS_PREINSTALLED}"'], fill=_PREINSTALLED_FILL),
+        )
+        sequence.conditional_formatting.add(
+            f"B2:B{len(records) + 1}",
+            FormulaRule(formula=[f'$B2="{STATUS_PENDING}"'], fill=_PENDING_FILL),
+        )
     group_ends: dict[str, int] = {}
     for row, record in enumerate(records, 2):
         group_ends[record["construction_group"]] = row
@@ -196,7 +227,7 @@ def build_manual_sequence_workbook(
     previous_group = None
     for row, record in enumerate(records, 2):
         group = record["construction_group"]
-        sequence.cell(row, 2).fill = fills[group]
+        sequence.cell(row, 3).fill = fills[group]
         if previous_group is not None and group != previous_group:
             for cell in sequence[row - 1]:
                 cell.border = Border(bottom=_MEDIUM)
@@ -216,10 +247,12 @@ def build_manual_sequence_workbook(
     last_row = len(records) + 1
     check_rows = [
         ("钢筋总数", f"=COUNTA('安装顺序'!$A$2:$A${last_row})"),
-        (f"{GROUP_BOTTOM}数量", f'=COUNTIF(\'安装顺序\'!$B$2:$B${last_row},"{GROUP_BOTTOM}")'),
-        (f"{GROUP_WEB}数量", f'=COUNTIF(\'安装顺序\'!$B$2:$B${last_row},"{GROUP_WEB}")'),
-        (f"{GROUP_TOP}数量", f'=COUNTIF(\'安装顺序\'!$B$2:$B${last_row},"{GROUP_TOP}")'),
-        ("顺序完整性", '=IF(AND(B4>0,B5>0,B6>0),"顺序完整","需检查")'),
+        (f"{STATUS_PREINSTALLED}数量", f'=COUNTIF(\'安装顺序\'!$B$2:$B${last_row},"{STATUS_PREINSTALLED}")'),
+        (f"{STATUS_PENDING}数量", f'=COUNTIF(\'安装顺序\'!$B$2:$B${last_row},"{STATUS_PENDING}")+COUNTBLANK(\'安装顺序\'!$B$2:$B${last_row})'),
+        (f"{GROUP_BOTTOM}数量", f'=COUNTIF(\'安装顺序\'!$C$2:$C${last_row},"{GROUP_BOTTOM}")'),
+        (f"{GROUP_WEB}数量", f'=COUNTIF(\'安装顺序\'!$C$2:$C${last_row},"{GROUP_WEB}")'),
+        (f"{GROUP_TOP}数量", f'=COUNTIF(\'安装顺序\'!$C$2:$C${last_row},"{GROUP_TOP}")'),
+        ("状态完整性", '=IF(B4=B5+B6,"状态完整","需检查")'),
         ("安装顺序", f"{GROUP_BOTTOM} → {GROUP_WEB} → {GROUP_TOP}"),
     ]
     for row, (label, value) in enumerate(check_rows, 4):
@@ -233,17 +266,17 @@ def build_manual_sequence_workbook(
         for cell in check[row][:2]:
             cell.border = Border(bottom=_THIN)
             cell.alignment = Alignment(vertical="center", wrap_text=True)
-    check["A11"] = "来源文件"
-    check["B11"] = source_filename
-    check["A12"] = "IFC schema"
-    check["B12"] = (ifc_meta or {}).get("ifc_schema", "unknown")
-    check["A13"] = "实体数"
-    check["B13"] = (ifc_meta or {}).get("entity_count", "")
-    check["A14"] = "表示映射数"
-    check["B14"] = (ifc_meta or {}).get("representation_map_count", "")
-    check["A15"] = "分组依据"
-    check["B15"] = grouping["group_rule"]
-    for row in range(11, 16):
+    check["A13"] = "来源文件"
+    check["B13"] = source_filename
+    check["A14"] = "IFC schema"
+    check["B14"] = (ifc_meta or {}).get("ifc_schema", "unknown")
+    check["A15"] = "实体数"
+    check["B15"] = (ifc_meta or {}).get("entity_count", "")
+    check["A16"] = "表示映射数"
+    check["B16"] = (ifc_meta or {}).get("representation_map_count", "")
+    check["A17"] = "分组依据"
+    check["B17"] = grouping["group_rule"]
+    for row in range(13, 18):
         check.cell(row, 1).fill = _LABEL_FILL
         check.cell(row, 1).font = _BOLD_FONT
         for cell in check[row][:2]:
@@ -261,8 +294,9 @@ def build_manual_sequence_workbook(
     instructions_rows = [
         ("字段", "说明"),
         ("name（必填）", "第一张“安装顺序”表中的 name 列是系统实际读取的字段。每行填一个 IFC 对应的 BIM 编号，例如 640520。"),
-        ("行顺序", "第 2 行表示第 1 根安装，第 3 行表示第 2 根安装；系统按 name 列的行顺序读取。"),
-        ("本表其他列", "其余列只用于核对模型信息，系统上传时只依赖 name 列；如调整顺序，请整行一起移动。"),
+        ("installation_status", f"下拉选择{STATUS_PENDING}或{STATUS_PREINSTALLED}。{STATUS_PREINSTALLED}钢筋不生成安装动画和机器人路径，但从第 1 根{STATUS_PENDING}钢筋开始就作为固定碰撞障碍。"),
+        ("行顺序", f"只对{STATUS_PENDING}钢筋生效：它们按表格行顺序依次安装；{STATUS_PREINSTALLED}钢筋可放在任意行。"),
+        ("本表其他列", "除 name 和 installation_status 外，其余列用于核对模型信息；如调整顺序，请整行一起移动。"),
         ("覆盖要求", f"必须保留全部 {len(records)} 根钢筋，每个 BIM 编号只出现一次；系统会自动检查缺失和重复。"),
         ("默认分组", f"本表已按 {GROUP_BOTTOM} → {GROUP_WEB} → {GROUP_TOP} 生成，分组只是建议，可通过调整 name 行顺序自由修改。"),
         ("上传方式", "在系统中选择“Excel 人工顺序”，上传修改后的文件；之后系统会继续执行六自由度安装路径碰撞检查。"),

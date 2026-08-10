@@ -134,10 +134,14 @@ def load_result_rebars(job_dir: Path) -> tuple[list[Rebar], list[dict]]:
     sequence: list[dict] = []
     with (job_dir / "output" / "installation_sequence.csv").open("r", encoding="utf-8-sig", newline="") as stream:
         for row in csv.DictReader(stream):
+            status = (row.get("installation_status") or "pending").strip().lower()
+            preinstalled = (row.get("preinstalled") or "").strip().lower() in {"1", "true", "yes"} or status == "preinstalled"
             sequence.append({
                 "installation_step": int(row["installation_step"]),
                 "bar_index": int(row["bar_index"]),
                 "entry_direction": [float(x) for x in row["entry_direction"].split(";")],
+                "preinstalled": preinstalled,
+                "installation_status": "preinstalled" if preinstalled else "pending",
             })
     return rebars, sequence
 

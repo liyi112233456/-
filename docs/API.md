@@ -51,6 +51,7 @@
 
 - `file`: an `.ifc` or `.ifczip` model.
 - The service parses all reinforcing bars and returns an editable `.xlsx` workbook.
+- The generated workbook includes `installation_status`. Use `待安装`/`pending` for simulated bars and `已安装`/`preinstalled` for bars already in place. Preinstalled bars are fixed step-0 collision obstacles and are excluded from assembly animation and robot-path output.
 - The first sheet `????` uses the `name` column as the required BIM identifier; row order is the installation order.
 - The workbook also includes `??` and `????` sheets. The default suggestion is bottom slab -> web -> top slab; users can move rows or edit the `name` column before uploading the workbook for planning.
 

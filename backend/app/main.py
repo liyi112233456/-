@@ -38,7 +38,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     lifespan=lifespan,
     title="钢筋空间拓扑与机器人施工规划系统",
-    version="1.2.0",
+    version="1.3.0",
     description="IFC 钢筋轴线恢复、多方向空间拓扑、Excel 人工顺序、六自由度安装碰撞检查和机器人 TCP 轨迹输出。",
 )
 app.add_middleware(GZipMiddleware, minimum_size=1024)

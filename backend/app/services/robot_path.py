@@ -130,6 +130,10 @@ def generate_robot_outputs(
     dt = float(cfg["robot_sample_period_s"])
     linear = float(cfg["robot_linear_speed_mm_s"])
     angular = float(cfg["robot_angular_speed_deg_s"])
+    preinstalled_bar_indices = [
+        int(row["bar_index"]) for row in sequence if bool(row.get("preinstalled", False))
+    ]
+    pending_sequence = [row for row in sequence if not bool(row.get("preinstalled", False))]
 
     tcp_csv = out_dir / "tcp_trajectory.csv"
     fields = [
@@ -143,7 +147,7 @@ def generate_robot_outputs(
     with tcp_csv.open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
-        for index, row in enumerate(sequence):
+        for index, row in enumerate(pending_sequence):
             bar = by_index[int(row["bar_index"])]
             direction = _norm(
                 np.asarray(row["entry_direction"], dtype=float), (0, 0, -1)
@@ -187,11 +191,11 @@ def generate_robot_outputs(
                     })
                     sample_count += 1
                 clock += samples[-1][0]
-            if index % max(1, len(sequence) // 20) == 0:
+            if index % max(1, len(pending_sequence) // 20) == 0:
                 cb(
                     "robot",
-                    0.972 + 0.018 * index / max(1, len(sequence)),
-                    f"Generate collision-approved robot TCP path {index + 1}/{len(sequence)}",
+                    0.972 + 0.018 * index / max(1, len(pending_sequence)),
+                    f"Generate collision-approved robot TCP path {index + 1}/{len(pending_sequence)}",
                 )
 
     preview = []
@@ -219,7 +223,10 @@ def generate_robot_outputs(
     _export_kuka(waypoints_all, out_dir / "rebar_install.src")
     _export_urscript(waypoints_all, out_dir / "rebar_install.script")
     summary = {
-        "requested_bar_count": len(sequence),
+        "total_bar_count": len(sequence),
+        "preinstalled_bar_count": len(preinstalled_bar_indices),
+        "preinstalled_bar_indices": preinstalled_bar_indices,
+        "requested_bar_count": len(pending_sequence),
         "exported_bar_count": len(waypoints_all),
         "skipped_unsafe_bar_count": len(skipped_bar_indices),
         "skipped_bar_indices": skipped_bar_indices,

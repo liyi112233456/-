@@ -156,6 +156,9 @@
       $('metricFeasible').textContent = collision.all_paths_collision_free
         ? `${collision.collision_free_count} 根通过`
         : `${collision.collision_detected_count} 根碰撞`;
+      if (collision.preinstalled_bar_count) {
+        $('metricFeasible').textContent = `${collision.preinstalled_bar_count} 根已安装，${$('metricFeasible').textContent}`;
+      }
       $('metricFeasible').style.color = collision.all_paths_collision_free ? 'var(--ok)' : 'var(--danger)';
     } else if (s?.planner?.strict_graph_feasible === true) {
       $('metricFeasible').textContent = '拓扑可行';
@@ -300,9 +303,14 @@
       for (const bar of state.model.bars) drawPolyline(bar.p, '#80909c', .55, .12);
     }
     // Installed bars.
-    const installed=[];
+    const installed=[], installedIds=new Set();
+    for (const barIndex of (state.model.initial_installed || [])) {
+      const bar=state.barsByIndex.get(barIndex);
+      if (bar && !installedIds.has(barIndex)) { installed.push(bar); installedIds.add(barIndex); }
+    }
     for (let s=0;s<Math.min(state.step,sequence.length);s++) {
-      const bar=state.barsByIndex.get(sequence[s].i); if (bar) installed.push(bar);
+      const barIndex=sequence[s].i, bar=state.barsByIndex.get(barIndex);
+      if (bar && !installedIds.has(barIndex)) { installed.push(bar); installedIds.add(barIndex); }
     }
     installed.sort((a,b)=>barDepth(a)-barDepth(b));
     for (const bar of installed) drawPolyline(bar.p, '#54a7ff', 1.15, .82);
@@ -347,6 +355,7 @@
 
   function updateStepUI() {
     const total=state.model?.sequence.length || 0;
+    const initialInstalled=state.model?.initial_installed?.length || 0;
     $('stepSlider').value=String(state.step);
     $('stepText').textContent=`${state.step.toLocaleString('zh-CN')} / ${total.toLocaleString('zh-CN')}`;
     if (state.model && state.step<total) {
@@ -354,6 +363,7 @@
       const pathText=path?` · ${path.path_type} · ${path.status==='collision_free'?'无碰撞':'检测到碰撞'}`:'';
       $('viewerInfo').textContent=`当前安装：第 ${state.step+1} 根 · 钢筋索引 ${item.i}${pathText}`;
     } else if (total) $('viewerInfo').textContent=`安装完成 · ${total.toLocaleString('zh-CN')} 根`;
+    else if (initialInstalled) $('viewerInfo').textContent=`模型中的 ${initialInstalled.toLocaleString('zh-CN')} 根钢筋均标记为已安装`;
   }
 
   function animate(now) {

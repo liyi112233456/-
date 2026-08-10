@@ -174,7 +174,7 @@ class CapsuleCollisionWorld:
     def _candidate_indices(
         self, start: np.ndarray, end: np.ndarray, moving_radius: float, step: int, moving_bar: int
     ) -> np.ndarray:
-        if self.tree is None or step <= 1:
+        if self.tree is None:
             return np.empty(0, dtype=np.int64)
         pad = moving_radius + self.max_radius + max(0.0, self.clearance_mm)
         lo = np.minimum(start[:2], end[:2]) - pad
@@ -590,6 +590,8 @@ def plan_assembly_paths(
     out_dir.mkdir(parents=True, exist_ok=True)
     by_index = {bar.index: bar for bar in rebars}
     step_by_bar = {int(row["bar_index"]): int(row["installation_step"]) for row in sequence}
+    preinstalled_rows = [row for row in sequence if bool(row.get("preinstalled", False))]
+    pending_rows = [row for row in sequence if not bool(row.get("preinstalled", False))]
     model_min = np.min([bar.bbox_min for bar in rebars], axis=0)
     model_max = np.max([bar.bbox_max for bar in rebars], axis=0)
     model_center = (model_min + model_max) * 0.5
@@ -598,7 +600,7 @@ def plan_assembly_paths(
     paths: list[dict] = []
     by_bar: dict[int, dict] = {}
 
-    for index, row in enumerate(sequence):
+    for index, row in enumerate(pending_rows):
         path = _plan_one(
             world, by_index[int(row["bar_index"])], row,
             model_min, model_max, model_center, cfg, rng,
@@ -606,11 +608,11 @@ def plan_assembly_paths(
         paths.append(path)
         by_bar[int(path["bar_index"])] = path
         row["entry_direction"] = path["entry_direction"]
-        if index % max(1, len(sequence) // 40) == 0:
+        if index % max(1, len(pending_rows) // 40) == 0:
             cb(
                 "collision",
-                0.89 + 0.075 * index / max(1, len(sequence)),
-                f"SE(3) collision checking {index + 1}/{len(sequence)}",
+                0.89 + 0.075 * index / max(1, len(pending_rows)),
+                f"SE(3) collision checking {index + 1}/{len(pending_rows)}",
             )
 
     feasible = sum(path["status"] == "collision_free" for path in paths)
@@ -620,6 +622,9 @@ def plan_assembly_paths(
         path_types[path["path_type"]] = path_types.get(path["path_type"], 0) + 1
     summary = {
         "planner": "rigid_rebar_discrete_se3",
+        "total_bar_count": len(sequence),
+        "preinstalled_bar_count": len(preinstalled_rows),
+        "simulated_bar_count": len(pending_rows),
         "bar_count": len(paths),
         "collision_free_count": feasible,
         "collision_detected_count": failed,
@@ -629,7 +634,7 @@ def plan_assembly_paths(
         "segment_pair_test_count": world.segment_tests,
         "translation_discretization_mm": float(cfg.get("assembly_translation_step_mm", 75.0)),
         "rotation_discretization_deg": float(cfg.get("assembly_rotation_step_deg", 7.5)),
-        "collision_model": "centerline capsules for installed rebars; target-pose contacts retained",
+        "collision_model": "centerline capsules; preinstalled bars are fixed step-0 obstacles; target-pose contacts retained",
         "rigid_body_dof": 6,
     }
     payload = {

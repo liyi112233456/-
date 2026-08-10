@@ -7,7 +7,9 @@
 - 从 `IfcFacetedBrep` 弯曲管状实体和 `IfcExtrudedAreaSolid` 直筋实体恢复中心轴；
 - 在 X/Y/Z 正反方向和循环核心任意方向上构造空间拓扑，生成安装顺序；
 - 可上传 Excel/CSV/TSV 人工安装顺序，最简只需一列 `name`，填写 BIM 可对照编号（如 `640520`），按行顺序替代自动拓扑顺序；
+- Directly parse IfcReinforcingBar products with IfcSweptDiskSolid / IfcCompositeCurve / IfcPolyline / IfcTrimmedCurve geometry, including circular bends, in addition to mapped BREP and extrusion geometry.
 - Generate an editable manual installation-order Excel workbook from an IFC via `POST /api/sequence/generate` or the web page button.
+- In manual-sequence files, `installation_status` can mark bars as `pending` or `preinstalled`; preinstalled bars skip animation and robot-path generation but remain fixed collision obstacles for every pending bar.
 - 对每根钢筋执行刚体六自由度路径搜索、任意转动和离散胶囊体碰撞检查；
 - 在网页中直接旋转、缩放和播放全部钢筋的安装动画；
 - 生成机械臂 TCP 位姿轨迹；

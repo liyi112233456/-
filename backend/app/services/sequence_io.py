@@ -13,6 +13,10 @@ from .ifc_geometry import Rebar
 
 HEADER_ALIASES = {
     "installation_step": {"installation_step", "step", "order", "\u5b89\u88c5\u987a\u5e8f", "\u5b89\u88c5\u5e8f\u53f7", "\u5e8f\u53f7"},
+    "installation_status": {
+        "installation_status", "install_status", "status", "preinstalled", "installed",
+        "\u5b89\u88c5\u72b6\u6001", "\u662f\u5426\u5df2\u5b89\u88c5", "\u521d\u59cb\u72b6\u6001",
+    },
     "bar_id": {"bar_id", "rebar_id", "id", "\u94a2\u7b4bid"},
     "bar_index": {"bar_index", "index", "\u94a2\u7b4b\u7d22\u5f15", "\u6a21\u578b\u7d22\u5f15"},
     "entity_id": {"entity_id", "ifc_entity_id", "ifc\u5b9e\u4f53id", "\u5b9e\u4f53id"},
@@ -26,6 +30,15 @@ HEADER_ALIASES = {
 
 IDENTIFIER_COLUMNS = ("bar_index", "entity_id", "guid", "tag", "name")
 GENERIC_IDENTIFIER_COLUMNS = ("bar_id", *IDENTIFIER_COLUMNS)
+
+PREINSTALLED_VALUES = {
+    "1", "true", "yes", "y", "installed", "preinstalled", "complete", "completed",
+    "\u662f", "\u5df2\u5b89\u88c5", "\u5df2\u5b8c\u6210", "\u5b8c\u6210",
+}
+PENDING_VALUES = {
+    "", "0", "false", "no", "n", "pending", "not_installed", "uninstalled",
+    "\u5426", "\u5f85\u5b89\u88c5", "\u672a\u5b89\u88c5", "\u672a\u5b8c\u6210",
+}
 
 
 def _normal_header(value: Any) -> str:
@@ -82,6 +95,17 @@ def _clean_text(value: Any) -> str:
     if isinstance(value, float) and value.is_integer():
         return str(int(value))
     return str(value).strip()
+
+
+def _parse_preinstalled(value: Any, sheet_row: int) -> bool:
+    token = _clean_text(value).lower().replace(" ", "").replace("-", "_")
+    if token in PREINSTALLED_VALUES:
+        return True
+    if token in PENDING_VALUES:
+        return False
+    raise ValueError(
+        f"\u7b2c {sheet_row} \u884c installation_status \u5fc5\u987b\u662f\u2018\u5f85\u5b89\u88c5\u2019\u6216\u2018\u5df2\u5b89\u88c5\u2019"
+    )
 
 
 def _manual_default_direction(bar: Rebar, model_center: np.ndarray) -> list[float]:
@@ -150,17 +174,19 @@ def load_manual_sequence(path: Path, rebars: list[Rebar]) -> tuple[list[dict], d
     if not rows:
         raise ValueError("\u4eba\u5de5\u5b89\u88c5\u987a\u5e8f\u8868\u4e3a\u7a7a\uff0c\u6216\u9996\u884c\u6ca1\u6709\u53ef\u8bc6\u522b\u7684\u5217\u540d")
     has_explicit_step = "installation_step" in rows[0]
+    has_installation_status = "installation_status" in rows[0]
     if not set(GENERIC_IDENTIFIER_COLUMNS).intersection(rows[0]):
         raise ValueError("\u4eba\u5de5\u5b89\u88c5\u987a\u5e8f\u8868\u81f3\u5c11\u9700\u8981 bar_id\uff08\u94a2\u7b4bID\uff09\uff0c\u6216 bar_index\u3001entity_id\u3001guid\u3001tag\u3001name \u4e2d\u7684\u4e00\u5217")
 
     lookups = _build_lookups(rebars)
     by_index = {bar.index: bar for bar in rebars}
 
-    parsed: list[tuple[int, Rebar, list[float] | None, int]] = []
+    parsed: list[tuple[int, Rebar, list[float] | None, int, bool]] = []
     for sheet_row, row in enumerate(rows, 2):
         if not any(_clean_text(value) for value in row.values()):
             continue
-        if has_explicit_step:
+        preinstalled = _parse_preinstalled(row.get("installation_status"), sheet_row)
+        if has_explicit_step and not preinstalled:
             try:
                 step = int(float(_clean_text(row.get("installation_step"))))
             except Exception as exc:
@@ -168,7 +194,9 @@ def load_manual_sequence(path: Path, rebars: list[Rebar]) -> tuple[list[dict], d
             if step <= 0:
                 raise ValueError(f"\u7b2c {sheet_row} \u884c\u5b89\u88c5\u987a\u5e8f\u5fc5\u987b\u5927\u4e8e 0")
         else:
-            step = len(parsed) + 1
+            # The final pending sequence is renumbered after preinstalled rows
+            # are separated, so sheet-row order is a stable temporary key.
+            step = sheet_row - 1
 
         matches = _match_row_to_bars(row, lookups)
         if not matches:
@@ -187,9 +215,10 @@ def load_manual_sequence(path: Path, rebars: list[Rebar]) -> tuple[list[dict], d
             if not math.isfinite(norm) or norm < 1e-9:
                 raise ValueError(f"\u7b2c {sheet_row} \u884c\u8fdb\u573a\u65b9\u5411\u4e0d\u80fd\u4e3a\u96f6\u5411\u91cf")
             direction = (d / norm).tolist()
-        parsed.append((step, bar, direction, sheet_row))
+        parsed.append((step, bar, direction, sheet_row, preinstalled))
 
-    if len({item[0] for item in parsed}) != len(parsed):
+    pending_parsed = [item for item in parsed if not item[4]]
+    if len({item[0] for item in pending_parsed}) != len(pending_parsed):
         raise ValueError("\u4eba\u5de5\u5b89\u88c5\u987a\u5e8f\u5b58\u5728\u91cd\u590d\u7684 installation_step")
     indexes = [item[1].index for item in parsed]
     if len(set(indexes)) != len(indexes):
@@ -199,14 +228,17 @@ def load_manual_sequence(path: Path, rebars: list[Rebar]) -> tuple[list[dict], d
         example = ", ".join(str(value) for value in missing[:10])
         raise ValueError(f"\u4eba\u5de5\u5b89\u88c5\u987a\u5e8f\u7f3a\u5c11 {len(missing)} \u6839\u94a2\u7b4b\uff08\u4f8b\u5982 bar_index: {example}\uff09")
 
-    parsed.sort(key=lambda item: item[0])
+    preinstalled_parsed = sorted((item for item in parsed if item[4]), key=lambda item: item[3])
+    pending_parsed.sort(key=lambda item: item[0])
     model_min = np.min([bar.bbox_min for bar in rebars], axis=0)
     model_max = np.max([bar.bbox_max for bar in rebars], axis=0)
     model_center = (model_min + model_max) * 0.5
     sequence: list[dict] = []
-    for new_step, (_, bar, direction, _) in enumerate(parsed, 1):
+    ordered = [(0, item) for item in preinstalled_parsed]
+    ordered.extend((new_step, item) for new_step, item in enumerate(pending_parsed, 1))
+    for installation_step, (_, bar, direction, _, preinstalled) in ordered:
         sequence.append({
-            "installation_step": new_step,
+            "installation_step": installation_step,
             "bar_index": bar.index,
             "entity_id": bar.entity_id,
             "guid": bar.guid,
@@ -216,15 +248,20 @@ def load_manual_sequence(path: Path, rebars: list[Rebar]) -> tuple[list[dict], d
             "radius_mm": bar.radius,
             "entry_direction": direction or _manual_default_direction(bar, model_center),
             "forced_core_resolution": False,
+            "preinstalled": preinstalled,
+            "installation_status": "preinstalled" if preinstalled else "pending",
         })
     return sequence, {
         "planner_mode": "manual_excel_sequence",
         "sequence_source": "excel",
         "row_count": len(sequence),
+        "preinstalled_bar_count": len(preinstalled_parsed),
+        "pending_bar_count": len(pending_parsed),
+        "has_installation_status_column": has_installation_status,
         "sequence_order_field": "installation_step" if has_explicit_step else "row_order",
         "strict_graph_feasible": None,
         "certification_scope": (
-            "user-supplied order; feasibility is established only by downstream "
-            "SE(3) collision checking"
+            "user-supplied order; preinstalled bars are fixed obstacles and pending-bar "
+            "feasibility is established only by downstream SE(3) collision checking"
         ),
     }

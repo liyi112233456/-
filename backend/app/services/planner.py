@@ -540,6 +540,8 @@ def plan_installation(
             "radius_mm": bar.radius,
             "entry_direction": entry.tolist(),
             "forced_core_resolution": bar_index in forced,
+            "preinstalled": False,
+            "installation_status": "pending",
         })
 
     stats = {
@@ -588,12 +590,15 @@ def save_planning_outputs(
         ],
     }
     (out_dir / "rebar_axes.json").write_text(json.dumps(axes_payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+    preinstalled_rows = [row for row in sequence if bool(row.get("preinstalled", False))]
+    pending_rows = [row for row in sequence if not bool(row.get("preinstalled", False))]
     with (out_dir / "installation_sequence.csv").open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.writer(stream)
-        writer.writerow(["installation_step", "bar_index", "entity_id", "guid", "name", "tag", "length_mm", "radius_mm", "entry_direction", "forced_core_resolution"])
+        writer.writerow(["installation_step", "installation_status", "preinstalled", "bar_index", "entity_id", "guid", "name", "tag", "length_mm", "radius_mm", "entry_direction", "forced_core_resolution"])
         for row in sequence:
             writer.writerow([
-                row["installation_step"], row["bar_index"], row["entity_id"], row["guid"], row["name"], row["tag"],
+                row["installation_step"], row.get("installation_status", "pending"), int(bool(row.get("preinstalled", False))),
+                row["bar_index"], row["entity_id"], row["guid"], row["name"], row["tag"],
                 f"{row['length_mm']:.5f}", f"{row['radius_mm']:.5f}", ";".join(f"{x:.8f}" for x in row["entry_direction"]),
                 int(row["forced_core_resolution"]),
             ])
@@ -608,7 +613,8 @@ def save_planning_outputs(
             }
             for b in rebars
         ],
-        "sequence": [{"i": r["bar_index"], "d": [round(x, 6) for x in r["entry_direction"]]} for r in sequence],
+        "initial_installed": [int(r["bar_index"]) for r in preinstalled_rows],
+        "sequence": [{"i": r["bar_index"], "d": [round(x, 6) for x in r["entry_direction"]]} for r in pending_rows],
     }
     (out_dir / "viewer_model.json").write_text(json.dumps(viewer, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     bbox_min = np.min([b.bbox_min for b in rebars], axis=0)
@@ -616,6 +622,8 @@ def save_planning_outputs(
     summary = {
         **meta,
         "rebar_count": len(rebars),
+        "preinstalled_bar_count": len(preinstalled_rows),
+        "simulated_installation_bar_count": len(pending_rows),
         "type_count": len(type_axes),
         "axis_total_length_m": float(sum(b.length for b in rebars) / 1000.0),
         "diameter_mm": {

@@ -43,11 +43,18 @@ def test_generate_manual_sequence_endpoint(monkeypatch):
         sheet = workbook.worksheets[0]
         assert [sheet.cell(row, 1).value for row in range(2, 5)] == ["640520", "640522", "715563"]
         assert sheet.cell(1, 1).value == "name"
+        assert sheet.cell(1, 2).value == "installation_status"
+        assert [sheet.cell(row, 2).value for row in range(2, 5)] == ["待安装"] * 3
+        sheet.cell(2, 2).value = "已安装"
         assert workbook.worksheets[1]["B4"].value.startswith("=COUNTA")
         workbook.active = 1
         workbook.save(output)
         sequence, stats = load_manual_sequence(output, bars)
         assert [item["tag"] for item in sequence] == ["640520", "640522", "715563"]
+        assert [item["installation_step"] for item in sequence] == [0, 1, 2]
+        assert [item["preinstalled"] for item in sequence] == [True, False, False]
+        assert stats["preinstalled_bar_count"] == 1
+        assert stats["pending_bar_count"] == 2
         assert stats["sequence_order_field"] == "row_order"
     finally:
         output.unlink(missing_ok=True)

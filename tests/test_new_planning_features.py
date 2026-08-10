@@ -1,17 +1,20 @@
 import csv
+import json
 from pathlib import Path
 
 import numpy as np
 from openpyxl import Workbook
 
 from app.services.assembly_path import (
+    CapsuleCollisionWorld,
     PoseState,
     _segment_distances_batch,
     _transform_axis,
     plan_assembly_paths,
 )
 from app.services.ifc_geometry import Rebar
-from app.services.planner import plan_installation
+from app.services.planner import plan_installation, save_planning_outputs
+from app.services.robot_path import generate_robot_outputs
 from app.services.sequence_io import load_manual_sequence
 
 
@@ -114,6 +117,37 @@ def test_manual_xlsx_name_column_accepts_bim_name_tail(tmp_path: Path):
     assert [row["bar_index"] for row in sequence] == [1, 0]
     assert stats["sequence_order_field"] == "row_order"
 
+
+def test_manual_xlsx_preinstalled_bars_are_step_zero(tmp_path: Path):
+    bars = [
+        make_bar(0, [[0, 0, 0], [100, 0, 0]]),
+        make_bar(1, [[0, 100, 0], [100, 100, 0]]),
+        make_bar(2, [[0, 200, 0], [100, 200, 0]]),
+    ]
+    path = tmp_path / "preinstalled_sequence.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["name", "installation_status"])
+    sheet.append(["bar-2", "待安装"])
+    sheet.append(["bar-0", "已安装"])
+    sheet.append(["bar-1", "待安装"])
+    workbook.save(path)
+
+    sequence, stats = load_manual_sequence(path, bars)
+    assert [row["bar_index"] for row in sequence] == [0, 2, 1]
+    assert [row["installation_step"] for row in sequence] == [0, 1, 2]
+    assert [row["preinstalled"] for row in sequence] == [True, False, False]
+    assert stats["preinstalled_bar_count"] == 1
+    assert stats["pending_bar_count"] == 2
+
+
+def test_preinstalled_bar_blocks_first_simulated_step():
+    fixed = make_bar(0, [[0, 0, 0], [100, 0, 0]])
+    moving = make_bar(1, [[0, 0, 0], [100, 0, 0]])
+    world = CapsuleCollisionWorld([fixed, moving], {0: 0, 1: 1}, 1.0)
+    contacts = world.contacts(moving, moving.axis, step=1)
+    assert 0 in contacts
+
 def test_automatic_topology_uses_multiple_candidate_axes():
     bars = [
         make_bar(0, [[0, 0, 0], [100, 0, 0]]),
@@ -156,3 +190,91 @@ def test_se3_collision_planner_outputs_safe_paths(tmp_path: Path):
     assert (tmp_path / "collision_report.json").is_file()
     with (tmp_path / "assembly_path_waypoints.csv").open(encoding="utf-8-sig") as stream:
         assert len(list(csv.DictReader(stream))) >= 4
+
+
+def test_se3_planner_skips_preinstalled_bar_but_keeps_it_as_obstacle(tmp_path: Path):
+    bars = [
+        make_bar(0, [[0, 0, 0], [100, 0, 0]]),
+        make_bar(1, [[0, 100, 0], [100, 100, 0]]),
+    ]
+    sequence = [
+        {
+            "installation_step": 0,
+            "bar_index": 0,
+            "entry_direction": [0.0, -1.0, 0.0],
+            "preinstalled": True,
+            "installation_status": "preinstalled",
+        },
+        {
+            "installation_step": 1,
+            "bar_index": 1,
+            "entry_direction": [0.0, -1.0, 0.0],
+            "preinstalled": False,
+            "installation_status": "pending",
+        },
+    ]
+    config = {
+        "clearance_mm": 1.0,
+        "grasp_fraction": 0.5,
+        "outside_margin_mm": 100.0,
+        "assembly_translation_step_mm": 25.0,
+        "assembly_rotation_step_deg": 10.0,
+        "assembly_rrt_iterations": 0,
+        "assembly_random_seed": 3,
+    }
+    paths, summary = plan_assembly_paths(tmp_path, bars, sequence, config)
+    assert set(paths) == {1}
+    assert summary["preinstalled_bar_count"] == 1
+    assert summary["simulated_bar_count"] == 1
+
+
+def test_viewer_starts_with_preinstalled_bars_and_animates_pending_only(tmp_path: Path):
+    bars = [
+        make_bar(0, [[0, 0, 0], [100, 0, 0]]),
+        make_bar(1, [[0, 100, 0], [100, 100, 0]]),
+    ]
+    sequence = []
+    for step, bar, preinstalled in [(0, bars[0], True), (1, bars[1], False)]:
+        sequence.append({
+            "installation_step": step,
+            "bar_index": bar.index,
+            "entity_id": bar.entity_id,
+            "guid": bar.guid,
+            "name": bar.name,
+            "tag": bar.tag,
+            "length_mm": bar.length,
+            "radius_mm": bar.radius,
+            "entry_direction": [0.0, -1.0, 0.0],
+            "forced_core_resolution": False,
+            "preinstalled": preinstalled,
+            "installation_status": "preinstalled" if preinstalled else "pending",
+        })
+    save_planning_outputs(tmp_path, bars, {}, sequence, {}, {})
+    viewer = json.loads((tmp_path / "viewer_model.json").read_text(encoding="utf-8"))
+    assert viewer["initial_installed"] == [0]
+    assert [row["i"] for row in viewer["sequence"]] == [1]
+
+
+def test_robot_export_excludes_preinstalled_bars(tmp_path: Path):
+    bars = [
+        make_bar(0, [[0, 0, 0], [100, 0, 0]]),
+        make_bar(1, [[0, 100, 0], [100, 100, 0]]),
+    ]
+    sequence = [
+        {"installation_step": 0, "bar_index": 0, "entry_direction": [0, -1, 0], "preinstalled": True},
+        {"installation_step": 1, "bar_index": 1, "entry_direction": [0, -1, 0], "preinstalled": False},
+    ]
+    config = {
+        "robot_sample_period_s": 0.1,
+        "robot_linear_speed_mm_s": 1000.0,
+        "robot_angular_speed_deg_s": 90.0,
+        "outside_margin_mm": 100.0,
+        "preinsert_distance_mm": 25.0,
+        "retreat_distance_mm": 25.0,
+        "grasp_fraction": 0.5,
+    }
+    summary = generate_robot_outputs(tmp_path, bars, sequence, config)
+    preview = json.loads((tmp_path / "robot_waypoints.json").read_text(encoding="utf-8"))
+    assert summary["preinstalled_bar_count"] == 1
+    assert summary["requested_bar_count"] == 1
+    assert [row["bar_index"] for row in preview] == [1]

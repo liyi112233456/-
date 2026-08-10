@@ -378,6 +378,193 @@ def extract_axis_from_extruded_solid(ifc: IFCIndex, map_id: int, solid_id: int) 
     return TypeAxis(map_id, axis, radius, 0, 0, 2, "extruded-circle-axis")
 
 
+
+def _trim_value(ifc: IFCIndex, token: str) -> tuple[str, object]:
+    """Read an IfcTrimmedCurve trim as either a point or a parameter."""
+    ref = token_ref(token)
+    if ref is not None and ref in ifc.entities:
+        return "point", ifc.point(ref)
+    values = numbers(token)
+    return "parameter", (values[0] if values else None)
+
+
+def _curve_parameter(value: object, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    return float(value)
+
+
+def _circle_parameter_radians(value: float) -> float:
+    # V1.ifc stores circle trims as degrees (for example 270 -> 360), while
+    # some exporters write radians. The range is enough to distinguish them.
+    return math.radians(value) if abs(value) > (2.0 * math.pi + 1e-6) else value
+
+
+def _curve_points(ifc: IFCIndex, curve_id: int, cache: dict[int, np.ndarray]) -> np.ndarray:
+    """Sample the common IFC curve entities used by swept-disk rebar."""
+    if curve_id in cache:
+        return cache[curve_id].copy()
+    typ, _ = ifc.get(curve_id)
+    fields = ifc.fields(curve_id)
+
+    if typ == "IFCPOLYLINE":
+        point_ids = refs(fields[0]) if fields else []
+        points = np.asarray([ifc.point(pid) for pid in point_ids], dtype=float)
+    elif typ == "IFCCOMPOSITECURVE":
+        points_list: list[np.ndarray] = []
+        for segment_id in refs(fields[0]) if fields else []:
+            segment_fields = ifc.fields(segment_id)
+            same_sense = len(segment_fields) < 2 or segment_fields[1] == ".T."
+            parent_id = token_ref(segment_fields[2]) if len(segment_fields) > 2 else None
+            if parent_id is None:
+                continue
+            part = _curve_points(ifc, parent_id, cache)
+            if not same_sense:
+                part = part[::-1]
+            if len(part) == 0:
+                continue
+            if points_list:
+                previous = points_list[-1][-1]
+                if np.linalg.norm(previous - part[-1]) < 1e-6 and np.linalg.norm(previous - part[0]) >= 1e-6:
+                    part = part[::-1]
+                if np.linalg.norm(previous - part[0]) < 1e-6:
+                    part = part[1:]
+            if len(part):
+                points_list.append(part)
+        points = np.vstack(points_list) if points_list else np.empty((0, 3), dtype=float)
+    elif typ == "IFCCOMPOSITECURVESEGMENT":
+        parent_id = token_ref(fields[2]) if len(fields) > 2 else None
+        points = _curve_points(ifc, parent_id, cache) if parent_id is not None else np.empty((0, 3), dtype=float)
+        if len(fields) > 1 and fields[1] == ".F.":
+            points = points[::-1]
+    elif typ == "IFCTRIMMEDCURVE":
+        basis_id = token_ref(fields[0]) if fields else None
+        if basis_id is None or basis_id not in ifc.entities:
+            points = np.empty((0, 3), dtype=float)
+        else:
+            basis_typ, _ = ifc.get(basis_id)
+            trim1_kind, trim1 = _trim_value(ifc, fields[1] if len(fields) > 1 else "$")
+            trim2_kind, trim2 = _trim_value(ifc, fields[2] if len(fields) > 2 else "$")
+            sense = len(fields) < 4 or fields[3] == ".T."
+            if basis_typ == "IFCCIRCLE":
+                bf = ifc.fields(basis_id)
+                placement_id = token_ref(bf[0])
+                placement = axis2placement_matrix(ifc, placement_id)
+                radius = float(bf[1])
+                if trim1_kind == "point":
+                    v = np.asarray(trim1) - placement[:3, 3]
+                    trim1 = math.atan2(float(v @ placement[:3, 1]), float(v @ placement[:3, 0]))
+                if trim2_kind == "point":
+                    v = np.asarray(trim2) - placement[:3, 3]
+                    trim2 = math.atan2(float(v @ placement[:3, 1]), float(v @ placement[:3, 0]))
+                start = _circle_parameter_radians(_curve_parameter(trim1))
+                end = _circle_parameter_radians(_curve_parameter(trim2, start))
+                delta = end - start
+                while delta > 2.0 * math.pi:
+                    delta -= 2.0 * math.pi
+                while delta < -2.0 * math.pi:
+                    delta += 2.0 * math.pi
+                count = max(3, int(math.ceil(abs(delta) / (math.pi / 18.0))) + 1)
+                params = np.linspace(start, start + delta, count)
+                points = placement[:3, 3] + radius * (
+                    np.cos(params)[:, None] * placement[:3, 0]
+                    + np.sin(params)[:, None] * placement[:3, 1]
+                )
+            elif basis_typ == "IFCLINE":
+                bf = ifc.fields(basis_id)
+                origin = ifc.point(token_ref(bf[0]))
+                direction = ifc.direction(token_ref(bf[1]), (1, 0, 0))
+                if trim1_kind == "point":
+                    p0 = np.asarray(trim1, dtype=float)
+                    t0 = float((p0 - origin) @ direction)
+                else:
+                    t0 = _curve_parameter(trim1)
+                    p0 = origin + direction * t0
+                if trim2_kind == "point":
+                    p1 = np.asarray(trim2, dtype=float)
+                    t1 = float((p1 - origin) @ direction)
+                else:
+                    t1 = _curve_parameter(trim2, t0 + 1.0)
+                    p1 = origin + direction * t1
+                points = np.asarray([p0, p1], dtype=float)
+            else:
+                points = np.empty((0, 3), dtype=float)
+            if not sense:
+                points = points[::-1]
+    elif typ == "IFCLINE":
+        origin = ifc.point(token_ref(fields[0]))
+        direction = ifc.direction(token_ref(fields[1]), (1, 0, 0))
+        points = np.asarray([origin, origin + direction], dtype=float)
+    else:
+        points = np.empty((0, 3), dtype=float)
+
+    cache[curve_id] = points.copy()
+    return points
+
+
+def extract_axis_from_swept_disk(
+    ifc: IFCIndex,
+    item_id: int,
+    simplify_mm: float = 0.75,
+    curve_cache: Optional[dict[int, np.ndarray]] = None,
+) -> TypeAxis:
+    fields = ifc.fields(item_id)
+    directrix_id = token_ref(fields[0]) if fields else None
+    if directrix_id is None:
+        raise ValueError(f"Invalid swept disk #{item_id}")
+    radius = float(fields[1]) if len(fields) > 1 and fields[1] not in ("$", "*") else 1.0
+    axis = _curve_points(ifc, directrix_id, curve_cache if curve_cache is not None else {})
+    if len(axis) < 2:
+        raise ValueError(f"Swept disk #{item_id} has no usable directrix")
+    axis = simplify_polyline(axis, simplify_mm)
+    return TypeAxis(item_id, axis, max(0.1, radius), 0, 0, len(axis), "swept-disk-directrix")
+
+
+def extract_axis_from_shape_item(
+    ifc: IFCIndex,
+    item_id: int,
+    simplify_mm: float = 0.75,
+    curve_cache: Optional[dict[int, np.ndarray]] = None,
+) -> TypeAxis:
+    typ, _ = ifc.get(item_id)
+    if typ in {"IFCSWEPTDISKSOLID", "IFCSWEPTDISKSOLIDTAPERED"}:
+        return extract_axis_from_swept_disk(ifc, item_id, simplify_mm, curve_cache)
+    if typ == "IFCFACETEDBREP":
+        V, loops, face_ids = mesh_from_brep(ifc, item_id)
+        if len(V) < 4:
+            raise ValueError(f"Too few vertices in BREP #{item_id}")
+        max_loop = max(len(x) for x in loops)
+        cap_candidates = [x for x in loops if len(x) == max_loop and len(x) >= 6]
+        if len(cap_candidates) >= 2:
+            centroids = np.asarray([V[x].mean(axis=0) for x in cap_candidates])
+            D = np.linalg.norm(centroids[:, None, :] - centroids[None, :, :], axis=2)
+            a, b = np.unravel_index(np.argmax(D), D.shape)
+            c0, c1 = centroids[a], centroids[b]
+            cap0, cap1 = cap_candidates[a], cap_candidates[b]
+        else:
+            mu = V.mean(0)
+            _, _, vh = np.linalg.svd(V - mu, full_matrices=False)
+            u = vh[0]
+            s = (V - mu) @ u
+            q = min(24, max(6, len(V) // 4))
+            cap0 = np.argsort(s)[:q].tolist()
+            cap1 = np.argsort(s)[-q:].tolist()
+            c0, c1 = V[cap0].mean(0), V[cap1].mean(0)
+        radius = float(max(0.1, 0.5 * (
+            np.median(np.linalg.norm(V[cap0] - c0, axis=1))
+            + np.median(np.linalg.norm(V[cap1] - c1, axis=1))
+        )))
+        axis = simplify_polyline(np.asarray([c0, c1]), simplify_mm)
+        return TypeAxis(item_id, axis, radius, len(V), len(face_ids), len(axis), "direct-brep-centroid")
+    if typ == "IFCEXTRUDEDAREASOLID":
+        return extract_axis_from_extruded_solid(ifc, item_id, item_id)
+    if typ in {"IFCPOLYLINE", "IFCCOMPOSITECURVE", "IFCTRIMMEDCURVE"}:
+        axis = _curve_points(ifc, item_id, curve_cache if curve_cache is not None else {})
+        if len(axis) < 2:
+            raise ValueError(f"Curve #{item_id} has no usable points")
+        return TypeAxis(item_id, simplify_polyline(axis, simplify_mm), 1.0, 0, 0, len(axis), "direct-curve")
+    raise ValueError(f"Unsupported direct shape item {typ} #{item_id}")
+
 def extract_axis_from_map(ifc: IFCIndex, map_id: int, simplify_mm: float = 0.75) -> TypeAxis:
     brep = find_representation_item(ifc, map_id, {"IFCFACETEDBREP"})
     if brep is not None:
@@ -414,33 +601,87 @@ def product_map_and_transform(ifc: IFCIndex, product_id: int, placement_cache: d
     return None, Tprod
 
 
-def extract_rebars(ifc: IFCIndex, type_axes: dict[int, TypeAxis]) -> list[Rebar]:
+def product_shape_items(
+    ifc: IFCIndex,
+    product_id: int,
+    placement_cache: dict[int, np.ndarray],
+) -> tuple[list[tuple[int, np.ndarray]], np.ndarray]:
+    """Return direct shape items and the product placement transform."""
+    f = ifc.fields(product_id)
+    placement_id = token_ref(f[5]) if len(f) > 5 else None
+    pds_id = token_ref(f[6]) if len(f) > 6 else None
+    Tprod = local_placement_matrix(ifc, placement_id, placement_cache)
+    if pds_id is None or pds_id not in ifc.entities:
+        return [], Tprod
+    items: list[tuple[int, np.ndarray]] = []
+    for rep_id in refs(ifc.get(pds_id)[1]):
+        if rep_id not in ifc.entities or ifc.get(rep_id)[0] != "IFCSHAPEREPRESENTATION":
+            continue
+        rep_fields = ifc.fields(rep_id)
+        for item_id in refs(rep_fields[3]) if len(rep_fields) > 3 else []:
+            if item_id in ifc.entities and ifc.get(item_id)[0] != "IFCMAPPEDITEM":
+                items.append((item_id, Tprod))
+    return items, Tprod
+
+
+def _product_radius_hint(fields: list[str]) -> Optional[float]:
+    # IfcReinforcingBar.NominalDiameter is attribute 9 in IFC2X3.
+    if len(fields) <= 9 or fields[9] in ("$", "*"):
+        return None
+    values = numbers(fields[9])
+    return float(values[0]) * 0.5 if values and values[0] > 0 else None
+
+
+def extract_rebars(ifc: IFCIndex, type_axes: dict[int, TypeAxis], simplify_mm: float = 0.75) -> list[Rebar]:
     out: list[Rebar] = []
     pcache: dict[int, np.ndarray] = {}
-    product_types = ["IFCREINFORCINGBAR", "IFCBUILDINGELEMENTPROXY"]
+    curve_cache: dict[int, np.ndarray] = {}
+    product_types = [
+        "IFCREINFORCINGBAR",
+        "IFCTENDON",
+        "IFCTENDONANCHOR",
+        "IFCBUILDINGELEMENTPROXY",
+    ]
     for product_type in product_types:
         for eid in ifc.by_type.get(product_type, []):
             f = ifc.fields(eid)
-            name = token_string(f[2]) or ""
-            objtype = token_string(f[4]) or ""
+            name = token_string(f[2]) or "" if len(f) > 2 else ""
+            objtype = token_string(f[4]) or "" if len(f) > 4 else ""
             tag = token_string(f[7]) or "" if len(f) > 7 else ""
-            map_id, T = product_map_and_transform(ifc, eid, pcache)
-            if map_id is None or map_id not in type_axes:
-                continue
-            ta = type_axes[map_id]
-            dims = np.ptp(ta.axis, axis=0)
-            slender = max(dims) / (2 * ta.radius + 1e-9)
-            is_rebar = product_type == "IFCREINFORCINGBAR" or "钢筋" in name or "钢筋" in objtype or slender >= 5.0
-            if not is_rebar:
-                continue
-            axis = transform_points(ta.axis, T)
-            scale = float(np.mean(np.linalg.norm(T[:3, :3], axis=0)))
-            r = ta.radius * scale
-            bmin = axis.min(0) - r
-            bmax = axis.max(0) + r
-            length = float(np.linalg.norm(np.diff(axis, axis=0), axis=1).sum())
-            guid = token_string(f[0]) or ""
-            out.append(Rebar(len(out), eid, guid, name, tag, map_id, axis, r, bmin, bmax, length))
+            map_id, Tmap = product_map_and_transform(ifc, eid, pcache)
+            candidates: list[tuple[TypeAxis, np.ndarray]] = []
+            if map_id is not None and map_id in type_axes:
+                candidates.append((type_axes[map_id], Tmap))
+            else:
+                direct_items, Tprod = product_shape_items(ifc, eid, pcache)
+                for item_id, _ in direct_items:
+                    try:
+                        ta = extract_axis_from_shape_item(
+                            ifc, item_id, simplify_mm=simplify_mm, curve_cache=curve_cache
+                        )
+                    except Exception:
+                        continue
+                    candidates.append((ta, Tprod))
+            for ta, T in candidates[:1]:
+                dims = np.ptp(ta.axis, axis=0)
+                hint = _product_radius_hint(f)
+                radius = hint if ta.method == "direct-curve" and hint is not None else ta.radius
+                slender = max(dims) / (2 * radius + 1e-9)
+                text = f"{name} {objtype}".casefold()
+                is_named_rebar = any(
+                    key in text for key in ("rebar", "reinforc", "tendon", "prestress", "pre-stress", "strand", "\u94a2\u7b4b", "\u9884\u5e94\u529b")
+                )
+                is_rebar = product_type in {"IFCREINFORCINGBAR", "IFCTENDON", "IFCTENDONANCHOR"} or is_named_rebar or slender >= 5.0
+                if not is_rebar:
+                    continue
+                axis = transform_points(ta.axis, T)
+                scale = float(np.mean(np.linalg.norm(T[:3, :3], axis=0)))
+                r = radius * scale
+                bmin = axis.min(0) - r
+                bmax = axis.max(0) + r
+                length = float(np.linalg.norm(np.diff(axis, axis=0), axis=1).sum())
+                guid = token_string(f[0]) or ""
+                out.append(Rebar(len(out), eid, guid, name, tag, ta.map_id, axis, r, bmin, bmax, length))
     return out
 
 
@@ -460,7 +701,8 @@ def parse_ifc_rebars(path: Path, simplify_mm: float = 0.75, progress: Optional[P
         if k % max(1, len(maps) // 20) == 0 or k == len(maps):
             cb("axis", 0.10 + 0.34 * k / max(1, len(maps)), f"已恢复 {k}/{len(maps)} 类几何")
     cb("instantiate", 0.46, "实例化钢筋轴线并应用 IFC 坐标变换")
-    rebars = extract_rebars(ifc, type_axes)
+    rebars = extract_rebars(ifc, type_axes, simplify_mm=simplify_mm)
+    direct_geometry_count = sum(1 for bar in rebars if bar.map_id not in type_axes)
     if not rebars:
         raise RuntimeError("未识别到钢筋。请检查 IFC 导出类别、名称或几何表达。")
     meta = {
@@ -470,6 +712,7 @@ def parse_ifc_rebars(path: Path, simplify_mm: float = 0.75, progress: Optional[P
         "axis_type_count": len(type_axes),
         "map_failure_count": len(failures),
         "map_failures": failures,
+        "direct_geometry_product_count": direct_geometry_count,
     }
     cb("instantiate", 0.52, f"识别到 {len(rebars)} 根钢筋")
     return rebars, type_axes, meta
