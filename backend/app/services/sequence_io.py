@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import math
 from pathlib import Path
 from typing import Any, Iterable
@@ -55,6 +56,21 @@ def _canonical_headers(values: Iterable[Any]) -> dict[int, str]:
 
 
 def _read_rows(path: Path) -> list[dict[str, Any]]:
+    if path.suffix.lower() == ".json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        items = payload.get("items") if isinstance(payload, dict) else payload
+        if not isinstance(items, list):
+            raise ValueError("可视化安装顺序 JSON 必须包含 items 数组")
+        rows: list[dict[str, Any]] = []
+        for index, item in enumerate(items, 1):
+            if not isinstance(item, dict):
+                raise ValueError(f"可视化安装顺序第 {index} 项格式错误")
+            rows.append({
+                "installation_step": item.get("installation_step", index),
+                "installation_status": item.get("installation_status", "pending"),
+                "bar_index": item.get("bar_index"),
+            })
+        return rows
     if path.suffix.lower() == ".xlsx":
         workbook = load_workbook(path, read_only=True, data_only=True)
         sheet = workbook.active
@@ -251,9 +267,10 @@ def load_manual_sequence(path: Path, rebars: list[Rebar]) -> tuple[list[dict], d
             "preinstalled": preinstalled,
             "installation_status": "preinstalled" if preinstalled else "pending",
         })
+    visual_source = path.suffix.lower() == ".json"
     return sequence, {
-        "planner_mode": "manual_excel_sequence",
-        "sequence_source": "excel",
+        "planner_mode": "manual_visual_sequence" if visual_source else "manual_excel_sequence",
+        "sequence_source": "visual" if visual_source else "excel",
         "row_count": len(sequence),
         "preinstalled_bar_count": len(preinstalled_parsed),
         "pending_bar_count": len(pending_parsed),

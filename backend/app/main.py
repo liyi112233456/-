@@ -22,7 +22,7 @@ from starlette.background import BackgroundTask
 
 from .config import JOBS_DIR, MAX_UPLOAD_MB
 from .models import PlanningOptions, RobotPathRequest
-from .services.ifc_geometry import parse_ifc_rebars
+from .services.ifc_geometry import parse_ifc_rebars, rebar_display_id
 from .services.manual_sequence_workbook import build_manual_sequence_workbook
 from .task_store import create_task, get_task, init_db, list_tasks
 
@@ -38,8 +38,8 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     lifespan=lifespan,
     title="钢筋空间拓扑规划与碰撞检测系统",
-    version="1.4.0",
-    description="IFC 钢筋轴线恢复、多方向空间拓扑、Excel 人工顺序、六自由度安装碰撞检查和机器人 TCP 轨迹输出。",
+    version="1.5.0",
+    description="IFC 钢筋轴线恢复、多方向空间拓扑、Excel 与可视化人工顺序、六自由度安装碰撞检查和机器人 TCP 轨迹输出。",
 )
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -77,6 +77,7 @@ async def create_planning_task(
     file: Annotated[UploadFile, File(...)],
     options_json: Annotated[str, Form()] = "{}",
     sequence_file: Annotated[UploadFile | None, File()] = None,
+    visual_sequence_json: Annotated[str | None, Form()] = None,
 ) -> dict:
     suffix = Path(file.filename or "model.ifc").suffix.lower()
     if suffix not in {".ifc", ".ifczip"}:
@@ -113,6 +114,22 @@ async def create_planning_task(
                         raise HTTPException(413, "Sequence file exceeds 20 MB")
                     stream.write(chunk)
             size += sequence_size
+        elif options.sequence_source == "visual":
+            if not visual_sequence_json:
+                raise HTTPException(400, "可视化人工顺序尚未设置")
+            try:
+                visual_payload = json.loads(visual_sequence_json)
+                items = visual_payload.get("items") if isinstance(visual_payload, dict) else None
+                if not isinstance(items, list) or not items:
+                    raise ValueError("items 必须是非空数组")
+            except Exception as exc:
+                raise HTTPException(422, f"可视化人工顺序格式无效: {exc}") from exc
+            encoded = json.dumps(visual_payload, ensure_ascii=False, separators=(",", ":"))
+            encoded_size = len(encoded.encode("utf-8"))
+            if encoded_size > 20 * 1024 * 1024:
+                raise HTTPException(413, "可视化人工顺序超过 20 MB")
+            (job_dir / "input_sequence.json").write_text(encoded, encoding="utf-8")
+            size += encoded_size
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
@@ -161,6 +178,46 @@ def _save_uploaded_ifc_for_sequence(file: UploadFile, temp_dir: Path) -> tuple[P
             return extracted, original_name
     except zipfile.BadZipFile as exc:
         raise HTTPException(400, "IFCZIP \u6587\u4ef6\u635f\u574f\u6216\u683c\u5f0f\u65e0\u6548") from exc
+
+
+@app.post("/api/sequence/preview")
+def preview_visual_sequence(file: Annotated[UploadFile, File(...)]) -> dict:
+    """Parse an IFC into the lightweight model used by the visual order editor."""
+    temp_dir = Path(tempfile.mkdtemp(prefix="visual_sequence_", dir=JOBS_DIR))
+    try:
+        input_path, source_name = _save_uploaded_ifc_for_sequence(file, temp_dir)
+        rebars, _, ifc_meta = parse_ifc_rebars(input_path)
+        return {
+            "units": "mm",
+            "source_filename": source_name,
+            "bars": [
+                {
+                    "i": bar.index,
+                    "n": rebar_display_id(bar),
+                    "name": bar.name,
+                    "tag": bar.tag,
+                    "r": round(bar.radius, 4),
+                    "p": bar.axis.round(3).tolist(),
+                }
+                for bar in rebars
+            ],
+            "initial_installed": [],
+            "sequence": [],
+            "meta": {
+                **ifc_meta,
+                "rebar_count": len(rebars),
+                "axis_total_length_m": sum(bar.length for bar in rebars) / 1000.0,
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            422,
+            f"IFC 解析或可视化模型生成失败：{type(exc).__name__}: {exc}",
+        ) from exc
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 @app.post("/api/sequence/generate")

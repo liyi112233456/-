@@ -77,3 +77,30 @@ END-ISO-10303-21;
     assert len(points) >= 4
     assert np.allclose(points[0], [10.0, 0.0, 0.0])
     assert np.allclose(points[-1], [0.0, 10.0, 0.0], atol=1e-6)
+
+
+def test_sample_trimmed_circle_wraps_across_zero_by_curve_sense(tmp_path):
+    from app.services.ifc_geometry import IFCIndex, _curve_points
+
+    content = """ISO-10303-21;
+HEADER;
+FILE_SCHEMA(('IFC2X3'));
+ENDSEC;
+DATA;
+#1=IFCCARTESIANPOINT((0.,0.,0.));
+#2=IFCDIRECTION((0.,0.,1.));
+#3=IFCDIRECTION((1.,0.,0.));
+#4=IFCAXIS2PLACEMENT3D(#1,#2,#3);
+#5=IFCCIRCLE(#4,10.);
+#6=IFCTRIMMEDCURVE(#5,(IFCPARAMETERVALUE(270.)),(IFCPARAMETERVALUE(45.)),.T.,.PARAMETER.);
+ENDSEC;
+END-ISO-10303-21;
+"""
+    path = tmp_path / "wrapped_arc.ifc"
+    path.write_text(content, encoding="latin1")
+    points = _curve_points(IFCIndex(path), 6, {})
+    length = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+
+    assert np.allclose(points[0], [0.0, -10.0, 0.0], atol=1e-6)
+    assert np.allclose(points[-1], [10.0 / np.sqrt(2), 10.0 / np.sqrt(2), 0.0], atol=1e-6)
+    assert abs(length - 10.0 * 3.0 * np.pi / 4.0) < 0.1

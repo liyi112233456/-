@@ -141,6 +141,29 @@ def test_manual_xlsx_preinstalled_bars_are_step_zero(tmp_path: Path):
     assert stats["pending_bar_count"] == 2
 
 
+def test_visual_json_sequence_uses_same_manual_validation(tmp_path: Path):
+    bars = [
+        make_bar(0, [[0, 0, 0], [100, 0, 0]]),
+        make_bar(1, [[0, 100, 0], [100, 100, 0]]),
+        make_bar(2, [[0, 200, 0], [100, 200, 0]]),
+    ]
+    path = tmp_path / "visual_sequence.json"
+    path.write_text(json.dumps({
+        "items": [
+            {"installation_step": 1, "bar_index": 2, "installation_status": "pending"},
+            {"installation_step": 2, "bar_index": 0, "installation_status": "preinstalled"},
+            {"installation_step": 3, "bar_index": 1, "installation_status": "pending"},
+        ]
+    }), encoding="utf-8")
+
+    sequence, stats = load_manual_sequence(path, bars)
+
+    assert [row["bar_index"] for row in sequence] == [0, 2, 1]
+    assert [row["installation_step"] for row in sequence] == [0, 1, 2]
+    assert stats["sequence_source"] == "visual"
+    assert stats["planner_mode"] == "manual_visual_sequence"
+
+
 def test_preinstalled_bar_blocks_first_simulated_step():
     fixed = make_bar(0, [[0, 0, 0], [100, 0, 0]])
     moving = make_bar(1, [[0, 0, 0], [100, 0, 0]])

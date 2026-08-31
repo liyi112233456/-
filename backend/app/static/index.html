@@ -4,14 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>钢筋空间拓扑规划与碰撞检测系统</title>
-  <link rel="stylesheet" href="/static/styles.css?v=1.4.0">
+  <link rel="stylesheet" href="/static/styles.css?v=1.5.0">
 </head>
 <body>
   <header class="topbar">
     <div>
       <div class="eyebrow">IFC · TOPOLOGY · ROBOTICS</div>
       <h1>钢筋空间拓扑规划与碰撞检测系统</h1>
-      <p>多方向空间拓扑、Excel 人工顺序、六自由度安装碰撞检查与机器人轨迹输出</p>
+      <p>多方向空间拓扑、可视化与 Excel 人工顺序、六自由度安装碰撞检查与机器人轨迹输出</p>
     </div>
     <div class="health" id="healthBadge">服务检查中</div>
   </header>
@@ -32,6 +32,7 @@
           <select id="sequenceSource">
             <option value="automatic" selected>自动多方向空间拓扑</option>
             <option value="excel">Excel 人工顺序</option>
+            <option value="visual">可视化人工顺序</option>
           </select>
         </label>
         <div id="sequenceUpload" class="sequence-upload hidden">
@@ -41,6 +42,10 @@
           </label>
           <a href="/api/templates/installation-sequence">下载 Excel 模板</a>
           <small>简表只需一列 name，填 BIM 编号（如 640520），行顺序即安装顺序。</small>
+        </div>
+        <div id="visualSequenceSetup" class="sequence-upload hidden">
+          <button id="visualSequenceBtn" type="button" disabled>解析 IFC 并打开可视化排序</button>
+          <small id="visualSequenceSummary">选择 IFC 后，可在三维模型中点击钢筋并指定安装顺序。</small>
         </div>
         <div class="sequence-generator">
           <button id="generateSequenceBtn" type="button" disabled>根据当前 IFC 生成人工顺序 Excel</button>
@@ -119,13 +124,44 @@
             <span><i class="legend-line collision"></i>碰撞路径</span>
           </div>
         </div>
-        <div class="player">
+        <div class="player" id="viewerPlayer">
           <button id="prevBtn" type="button">◀</button>
           <button id="playBtn" type="button" class="primary small-btn">播放</button>
           <button id="nextBtn" type="button">▶</button>
           <input id="stepSlider" type="range" min="0" max="1" value="0">
           <span id="stepText">0 / 0</span>
-          <label>速度<select id="speedSelect"><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="5">5×</option><option value="10">10×</option></select></label>
+          <label>速度<select id="speedSelect"><option value="0.01">0.01×</option><option value="0.03">0.03×</option><option value="0.05">0.05×</option><option value="0.1">0.1×</option><option value="0.25">0.25×</option><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="5">5×</option><option value="10">10×</option></select></label>
+        </div>
+      </section>
+
+      <section class="panel visual-sequence-editor hidden" id="visualSequenceEditor">
+        <div class="visual-editor-head">
+          <div>
+            <div class="eyebrow">VISUAL SEQUENCE EDITOR</div>
+            <h2>可视化指定钢筋安装顺序</h2>
+            <p>点击三维模型中的钢筋可依次加入，也可在下方搜索后添加。</p>
+          </div>
+          <div class="visual-editor-actions">
+            <button id="visualFillBtn" type="button">全部按模型顺序加入</button>
+            <button id="visualClearBtn" type="button">清空</button>
+            <button id="visualSaveBtn" type="button" class="primary">保存人工顺序</button>
+            <button id="visualCloseBtn" type="button">收起</button>
+          </div>
+        </div>
+        <div class="visual-editor-status">
+          <strong id="visualEditorProgress">已排序 0 / 0</strong>
+          <span>顺序完整后才能开始计算；“已安装”的钢筋只作为后续碰撞障碍物。</span>
+        </div>
+        <div class="visual-editor-grid">
+          <section class="visual-editor-column">
+            <label>查找未排序钢筋<input id="visualSequenceSearch" type="search" placeholder="输入 BIM ID、name 或索引"></label>
+            <div class="visual-list-title"><span>未排序钢筋</span><b id="visualAvailableCount">0</b></div>
+            <div id="visualAvailableList" class="visual-sequence-list"></div>
+          </section>
+          <section class="visual-editor-column">
+            <div class="visual-list-title"><span>安装顺序（可拖动调整）</span><b id="visualOrderedCount">0</b></div>
+            <div id="visualOrderedList" class="visual-sequence-list ordered"></div>
+          </section>
         </div>
       </section>
 
@@ -164,6 +200,6 @@
   <footer>
     <span>FastAPI 后台计算服务</span><span>浏览器自包含三维线框渲染器</span><span>ABB · KUKA · UR · CSV</span>
   </footer>
-  <script src="/static/app.js?v=1.4.0"></script>
+  <script src="/static/app.js?v=1.5.0"></script>
 </body>
 </html>

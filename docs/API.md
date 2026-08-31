@@ -7,6 +7,7 @@
 - `file`: IFC 文件；
 - `options_json`: `PlanningOptions` JSON；
 - `sequence_file`: 当 `sequence_source=excel` 时必填，支持 `.xlsx`、`.csv`、`.tsv`。
+- `visual_sequence_json`: 当 `sequence_source=visual` 时必填；内容为可视化编辑器生成的完整顺序和 `pending` / `preinstalled` 状态。
 
 返回 `202` 和 `task_id`。后台以独立 Python 进程执行计算。
 
@@ -54,6 +55,10 @@
 - The generated workbook includes `installation_status`. Use `待安装`/`pending` for simulated bars and `已安装`/`preinstalled` for bars already in place. Preinstalled bars are fixed step-0 collision obstacles and are excluded from assembly animation and robot-path output.
 - The first sheet `????` uses the `name` column as the required BIM identifier; row order is the installation order.
 - The workbook also includes `??` and `????` sheets. The default suggestion is bottom slab -> web -> top slab; users can move rows or edit the `name` column before uploading the workbook for planning.
+
+## 可视化人工顺序
+
+`POST /api/sequence/preview`（`multipart/form-data`）接收 `file`，返回轻量三维钢筋轴线、BIM ID、半径和索引。网页编辑器可通过点选模型或搜索 BIM ID 加入钢筋，支持拖动、上移/下移、移除以及“已安装”标记；保存时必须完整覆盖 IFC 中的全部钢筋，随后以 `sequence_source=visual` 创建任务。
 
 ## Excel 顺序模板
 

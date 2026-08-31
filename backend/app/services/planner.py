@@ -12,7 +12,7 @@ from shapely.geometry import LineString, Point, box
 from shapely.ops import nearest_points
 from shapely.strtree import STRtree
 
-from .ifc_geometry import Rebar, TypeAxis
+from .ifc_geometry import Rebar, TypeAxis, rebar_display_id
 
 Progress = Callable[[str, float, str], None]
 
@@ -608,7 +608,7 @@ def save_planning_outputs(
         "bars": [
             {
                 "i": b.index,
-                "n": (str(b.name or "").rsplit(":", 1)[-1].strip() or str(b.name or "")),
+                "n": rebar_display_id(b),
                 "r": round(b.radius, 4),
                 "p": np.round(b.axis, 3).tolist(),
             }

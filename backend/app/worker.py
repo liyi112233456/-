@@ -60,11 +60,11 @@ def run_planning_job(task_id: str) -> None:
             float(options.get("axis_simplify_mm", 0.75)),
             progress=cb,
         )
-        if options.get("sequence_source") == "excel":
+        if options.get("sequence_source") in {"excel", "visual"}:
             sequence_files = sorted(job_dir.glob("input_sequence.*"))
             if len(sequence_files) != 1:
                 raise ValueError("Exactly one manual sequence file is required")
-            cb("sequence", 0.54, "Validate the user-supplied Excel installation order")
+            cb("sequence", 0.54, "校验用户指定的人工安装顺序")
             sequence, planner_stats = load_manual_sequence(sequence_files[0], rebars)
         else:
             sequence, planner_stats = plan_installation(

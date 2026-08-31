@@ -137,6 +137,19 @@ class Rebar:
     length: float
 
 
+def rebar_display_id(bar: Rebar) -> str:
+    """Return a concise BIM-facing identifier for viewer and ordering UI."""
+    name = str(bar.name or "").strip()
+    parts = [part.strip() for part in name.split(":") if part.strip()]
+    for part in reversed(parts):
+        if part.isdigit() and len(part) >= 3:
+            return part
+    tag = str(bar.tag or "").strip()
+    if tag.isdigit() and len(tag) >= 3:
+        return tag
+    return name or tag or bar.guid or str(bar.index)
+
+
 def axis2placement_matrix(ifc: IFCIndex, eid: Optional[int]) -> np.ndarray:
     T = np.eye(4)
     if eid is None:
@@ -400,6 +413,21 @@ def _circle_parameter_radians(value: float) -> float:
     return math.radians(value) if abs(value) > (2.0 * math.pi + 1e-6) else value
 
 
+def _circle_sweep_delta(start: float, end: float, sense_agreement: bool) -> float:
+    """Return the directed circle sweep while preserving IFC curve sense."""
+    turn = 2.0 * math.pi
+    raw = end - start
+    if sense_agreement:
+        delta = raw % turn
+        if abs(delta) < 1e-12 and abs(raw) > 1e-12:
+            delta = turn
+    else:
+        delta = -((-raw) % turn)
+        if abs(delta) < 1e-12 and abs(raw) > 1e-12:
+            delta = -turn
+    return delta
+
+
 def _curve_points(ifc: IFCIndex, curve_id: int, cache: dict[int, np.ndarray]) -> np.ndarray:
     """Sample the common IFC curve entities used by swept-disk rebar."""
     if curve_id in cache:
@@ -459,11 +487,7 @@ def _curve_points(ifc: IFCIndex, curve_id: int, cache: dict[int, np.ndarray]) ->
                     trim2 = math.atan2(float(v @ placement[:3, 1]), float(v @ placement[:3, 0]))
                 start = _circle_parameter_radians(_curve_parameter(trim1))
                 end = _circle_parameter_radians(_curve_parameter(trim2, start))
-                delta = end - start
-                while delta > 2.0 * math.pi:
-                    delta -= 2.0 * math.pi
-                while delta < -2.0 * math.pi:
-                    delta += 2.0 * math.pi
+                delta = _circle_sweep_delta(start, end, sense)
                 count = max(3, int(math.ceil(abs(delta) / (math.pi / 18.0))) + 1)
                 params = np.linspace(start, start + delta, count)
                 points = placement[:3, 3] + radius * (

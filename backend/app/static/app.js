@@ -7,8 +7,11 @@
     model: null, barsByIndex: new Map(), robotWaypoints: new Map(), assemblyPaths: new Map(),
     step: 0, alpha: 0, playing: false, speed: 1,
     lastFrame: performance.now(), yaw: -0.78, pitch: 0.42, zoom: 1,
-    dragging: false, lastX: 0, lastY: 0,
+    dragging: false, lastX: 0, lastY: 0, dragStartX: 0, dragStartY: 0,
     center: [0,0,0], span: 1, baseScale: 1,
+    visualEditorActive: false, visualOrder: [], visualPreinstalled: new Set(),
+    visualSelected: null, visualSequencePayload: null, visualSourceKey: null,
+    visualDragIndex: null,
   };
 
   const canvas = $('viewerCanvas');
@@ -29,6 +32,25 @@
   function updateSequenceGeneratorState() {
     const button = $('generateSequenceBtn');
     if (button) button.disabled = !$('fileInput').files?.[0];
+    const visualButton = $('visualSequenceBtn');
+    if (visualButton) visualButton.disabled = !$('fileInput').files?.[0];
+  }
+
+  function selectedFileKey() {
+    const file=$('fileInput').files?.[0];
+    return file?[file.name,file.size,file.lastModified].join(':'):null;
+  }
+
+  function resetVisualSequence() {
+    state.visualEditorActive=false;
+    state.visualOrder=[];
+    state.visualPreinstalled=new Set();
+    state.visualSelected=null;
+    state.visualSequencePayload=null;
+    state.visualSourceKey=null;
+    $('visualSequenceEditor').classList.add('hidden');
+    $('viewerPlayer').classList.remove('hidden');
+    $('visualSequenceSummary').textContent='选择 IFC 后，可在三维模型中点击钢筋并指定安装顺序。';
   }
 
   async function generateSequenceWorkbook() {
@@ -67,6 +89,148 @@
     } finally {
       updateSequenceGeneratorState();
     }
+  }
+
+  function visualBarTitle(bar) {
+    return bar?.n || ('钢筋索引 ' + bar?.i);
+  }
+
+  function visualBarDetails(bar) {
+    const name=bar?.name&&bar.name!==bar.n?bar.name:'';
+    return ('索引 ' + bar.i + ' · 直径 ' + (2*bar.r).toFixed(1) + ' mm' + (name?' · '+name:''));
+  }
+
+  function showVisualEditor() {
+    if(!state.model?.bars?.length||state.visualSourceKey!==selectedFileKey())return;
+    state.visualEditorActive=true;
+    $('visualSequenceEditor').classList.remove('hidden');
+    $('viewerPlayer').classList.add('hidden');
+    $('emptyState').classList.add('hidden');
+    renderVisualSequenceEditor();
+    draw();
+    document.querySelector('.viewer-panel')?.scrollIntoView({behavior:'smooth',block:'start'});
+  }
+
+  async function loadVisualSequencePreview() {
+    const file=$('fileInput').files[0];
+    if(!file){showNote('请先选择 IFC 文件。',true);return;}
+    if(state.visualSourceKey===selectedFileKey()&&state.model?.source_filename===file.name){
+      showVisualEditor();return;
+    }
+    const button=$('visualSequenceBtn'),form=new FormData();
+    form.append('file',file);button.disabled=true;
+    showNote('正在解析 IFC 并生成可点击的三维模型…');
+    try{
+      const model=await api('/api/sequence/preview',{method:'POST',body:form});
+      if(state.eventSource){state.eventSource.close();state.eventSource=null;}
+      state.currentTask=null;renderTaskList();
+      state.model=model;
+      state.barsByIndex=new Map(model.bars.map(bar=>[bar.i,bar]));
+      state.assemblyPaths=new Map();state.robotWaypoints=new Map();
+      state.step=0;state.alpha=0;state.playing=false;
+      state.visualOrder=[];state.visualPreinstalled=new Set();state.visualSelected=null;
+      state.visualSequencePayload=null;state.visualSourceKey=selectedFileKey();
+      state.visualEditorActive=true;
+      $('visualSequenceEditor').classList.remove('hidden');
+      $('viewerPlayer').classList.add('hidden');
+      $('emptyState').classList.add('hidden');
+      $('metricBars').textContent=model.bars.length.toLocaleString('zh-CN');
+      $('metricTypes').textContent=(model.meta?.axis_type_count||0).toLocaleString('zh-CN');
+      $('metricLength').textContent=(model.meta?.axis_total_length_m||0).toFixed(1)+' m';
+      $('metricFeasible').textContent='待指定顺序';
+      $('metricFeasible').style.color='var(--orange)';
+      computeBounds();fitView();renderVisualSequenceEditor();
+      $('visualSequenceSummary').textContent='已解析 '+model.bars.length.toLocaleString('zh-CN')+' 根钢筋，等待指定完整顺序。';
+      showNote('模型已加载：点击三维钢筋即可按安装先后依次加入。');
+    }catch(err){showNote(err.message,true);}
+    finally{updateSequenceGeneratorState();}
+  }
+
+  function renderVisualSequenceEditor() {
+    const bars=state.model?.bars||[],orderedSet=new Set(state.visualOrder);
+    const term=$('visualSequenceSearch').value.trim().toLowerCase();
+    const available=bars.filter(bar=>{
+      if(orderedSet.has(bar.i))return false;
+      if(!term)return true;
+      return [bar.i,bar.n,bar.name,bar.tag].some(value=>String(value??'').toLowerCase().includes(term));
+    });
+    $('visualAvailableCount').textContent=(bars.length-state.visualOrder.length).toLocaleString('zh-CN');
+    $('visualOrderedCount').textContent=state.visualOrder.length.toLocaleString('zh-CN');
+    $('visualEditorProgress').textContent='已排序 '+state.visualOrder.length.toLocaleString('zh-CN')+' / '+bars.length.toLocaleString('zh-CN');
+    const shown=available.slice(0,300);
+    $('visualAvailableList').innerHTML=shown.length?shown.map(bar=>
+      '<button type=\"button\" class=\"visual-candidate\" data-add=\"'+bar.i+'\">'+
+      '<span class=\"visual-bar-text\"><strong>'+escapeHtml(visualBarTitle(bar))+'</strong>'+
+      '<small>'+escapeHtml(visualBarDetails(bar))+'</small></span><span class=\"visual-add\">＋</span></button>'
+    ).join(''):'<div class=\"visual-sequence-empty\">没有符合条件的未排序钢筋</div>';
+    if(available.length>shown.length){
+      $('visualAvailableList').insertAdjacentHTML('beforeend','<div class=\"visual-sequence-empty\">还有 '+(available.length-shown.length).toLocaleString('zh-CN')+' 根，请输入 BIM ID 缩小范围</div>');
+    }
+    $('visualOrderedList').innerHTML=state.visualOrder.length?state.visualOrder.map((barIndex,index)=>{
+      const bar=state.barsByIndex.get(barIndex),selected=barIndex===state.visualSelected?' selected':'';
+      const checked=state.visualPreinstalled.has(barIndex)?' checked':'';
+      return '<div class=\"visual-order-row'+selected+'\" draggable=\"true\" data-order-index=\"'+index+'\" data-bar-index=\"'+barIndex+'\">'+
+        '<span class=\"visual-order-number\">'+(index+1)+'</span>'+
+        '<span class=\"visual-bar-text\"><strong>'+escapeHtml(visualBarTitle(bar))+'</strong><small>'+escapeHtml(visualBarDetails(bar))+'</small></span>'+
+        '<label class=\"visual-installed\"><input type=\"checkbox\" data-installed=\"'+barIndex+'\"'+checked+'> 已安装</label>'+
+        '<button type=\"button\" data-move=\"-1\" title=\"上移\">↑</button>'+
+        '<button type=\"button\" data-move=\"1\" title=\"下移\">↓</button>'+
+        '<button type=\"button\" class=\"remove\" data-remove=\"'+barIndex+'\" title=\"移除\">×</button></div>';
+    }).join(''):'<div class=\"visual-sequence-empty\">点击三维钢筋或左侧“＋”开始排序</div>';
+  }
+
+  function addVisualBar(barIndex) {
+    if(!state.barsByIndex.has(barIndex))return;
+    if(!state.visualOrder.includes(barIndex))state.visualOrder.push(barIndex);
+    state.visualSelected=barIndex;state.visualSequencePayload=null;
+    renderVisualSequenceEditor();draw();
+  }
+
+  function moveVisualBar(from,to) {
+    if(from<0||from>=state.visualOrder.length)return;
+    to=Math.max(0,Math.min(state.visualOrder.length-1,to));
+    if(from===to)return;
+    const [barIndex]=state.visualOrder.splice(from,1);
+    state.visualOrder.splice(to,0,barIndex);
+    state.visualSelected=barIndex;state.visualSequencePayload=null;
+    renderVisualSequenceEditor();draw();
+  }
+
+  function fillVisualOrder() {
+    const assigned=new Set(state.visualOrder);
+    for(const bar of state.model?.bars||[])if(!assigned.has(bar.i))state.visualOrder.push(bar.i);
+    state.visualSequencePayload=null;renderVisualSequenceEditor();draw();
+  }
+
+  function clearVisualOrder() {
+    state.visualOrder=[];state.visualPreinstalled=new Set();state.visualSelected=null;
+    state.visualSequencePayload=null;renderVisualSequenceEditor();draw();
+  }
+
+  function saveVisualOrder() {
+    const total=state.model?.bars?.length||0;
+    if(!total||state.visualOrder.length!==total){
+      showNote('顺序尚不完整：还需加入 '+(total-state.visualOrder.length)+' 根钢筋。',true);return;
+    }
+    state.visualSequencePayload={items:state.visualOrder.map((barIndex,index)=>({
+      installation_step:index+1,
+      bar_index:barIndex,
+      installation_status:state.visualPreinstalled.has(barIndex)?'preinstalled':'pending',
+    }))};
+    state.visualEditorActive=false;
+    $('visualSequenceEditor').classList.add('hidden');
+    $('viewerPlayer').classList.remove('hidden');
+    const installed=state.visualPreinstalled.size;
+    $('visualSequenceSummary').textContent='顺序已保存：共 '+total+' 根，其中 '+installed+' 根标记为已安装。';
+    showNote('可视化人工顺序已保存，可以开始计算。');
+    draw();$('viewerInfo').textContent='可视化人工顺序已保存 · '+total+' 根钢筋';
+  }
+
+  function closeVisualEditor() {
+    state.visualEditorActive=false;
+    $('visualSequenceEditor').classList.add('hidden');
+    $('viewerPlayer').classList.remove('hidden');
+    draw();
   }
 
   async function checkHealth() {
@@ -113,6 +277,9 @@
 
   async function selectTask(taskId) {
     try {
+      state.visualEditorActive=false;
+      $('visualSequenceEditor').classList.add('hidden');
+      $('viewerPlayer').classList.remove('hidden');
       const task = await api(`/api/tasks/${taskId}`);
       state.currentTask = task;
       renderTaskList();
@@ -196,6 +363,9 @@
 
   async function loadTaskResults(taskId) {
     try {
+      state.visualEditorActive=false;
+      $('visualSequenceEditor').classList.add('hidden');
+      $('viewerPlayer').classList.remove('hidden');
       $('viewerInfo').textContent = '加载三维数据…';
       const model = await api(`/api/tasks/${taskId}/files/viewer_model.json`);
       if (state.currentTask?.id !== taskId) return;
@@ -413,10 +583,54 @@
     $('motionRotation').textContent=`${motion.rotationDone.toFixed(1)} / ${motion.rotationTotal.toFixed(1)}°`;
   }
 
+  function drawVisualEditorModel() {
+    updateMotionHud(null,null);
+    $('motionLegend').classList.add('hidden');
+    const orderedSet=new Set(state.visualOrder);
+    const available=(state.model?.bars||[]).filter(bar=>!orderedSet.has(bar.i)).sort((a,b)=>barDepth(a)-barDepth(b));
+    const ordered=state.visualOrder.map(index=>state.barsByIndex.get(index)).filter(Boolean).sort((a,b)=>barDepth(a)-barDepth(b));
+    for(const bar of available)drawPolyline(bar.p,'#8b98a3',.75,.22);
+    for(const bar of ordered){
+      const installed=state.visualPreinstalled.has(bar.i);
+      drawPolyline(bar.p,installed?'#60d394':'#54a7ff',installed?1.8:1.45,.9);
+    }
+    const selected=state.barsByIndex.get(state.visualSelected);
+    if(selected)drawPolyline(selected.p,'#ff9d45',3,1);
+    $('viewerInfo').textContent='可视化排序：已排 '+state.visualOrder.length.toLocaleString('zh-CN')+
+      ' / '+state.model.bars.length.toLocaleString('zh-CN')+' · 点击钢筋加入';
+  }
+
+  function pointSegmentDistance(px,py,ax,ay,bx,by) {
+    const dx=bx-ax,dy=by-ay,lengthSquared=dx*dx+dy*dy;
+    if(!lengthSquared)return Math.hypot(px-ax,py-ay);
+    const t=Math.max(0,Math.min(1,((px-ax)*dx+(py-ay)*dy)/lengthSquared));
+    return Math.hypot(px-(ax+t*dx),py-(ay+t*dy));
+  }
+
+  function selectVisualBarAt(event) {
+    if(!state.visualEditorActive||!state.model)return;
+    const rect=canvas.getBoundingClientRect();
+    const px=(event.clientX-rect.left)*(canvas.width/rect.width);
+    const py=(event.clientY-rect.top)*(canvas.height/rect.height);
+    let closest=null,best=12*dpr;
+    for(const bar of state.model.bars){
+      for(let i=1;i<bar.p.length;i++){
+        const a=rotatePoint(bar.p[i-1]),b=rotatePoint(bar.p[i]);
+        const distance=pointSegmentDistance(px,py,a[0],a[1],b[0],b[1]);
+        if(distance<best){best=distance;closest=bar;}
+      }
+    }
+    if(!closest)return;
+    if(state.visualOrder.includes(closest.i)){
+      state.visualSelected=closest.i;renderVisualSequenceEditor();draw();
+    }else addVisualBar(closest.i);
+  }
+
   function draw() {
     resizeCanvas();
     ctx.clearRect(0,0,canvas.width,canvas.height);
     if (!state.model) { updateMotionHud(null,null); return; }
+    if(state.visualEditorActive){drawVisualEditorModel();drawAxes();return;}
     const sequence=state.model.sequence;
     if ($('ghostToggle').checked) {
       for (const bar of state.model.bars) drawPolyline(bar.p, '#80909c', .55, .12);
@@ -494,7 +708,7 @@
 
   function animate(now) {
     const dt=Math.min(.08,(now-state.lastFrame)/1000);state.lastFrame=now;
-    if(state.playing&&state.model){
+    if(state.playing&&state.model&&!state.visualEditorActive){
       state.alpha+=dt*state.speed*2.2;
       if(state.alpha>=1){state.alpha=0;state.step++;
         if(state.step>=state.model.sequence.length){state.step=state.model.sequence.length;state.playing=false;$('playBtn').textContent='播放';}
@@ -510,6 +724,9 @@
     if(!file){showNote('请选择 IFC 文件。',true);return;}
     const sequenceSource=$('sequenceSource').value,sequenceFile=$('sequenceFile').files[0];
     if(sequenceSource==='excel'&&!sequenceFile){showNote('请选择 Excel 安装顺序表。',true);return;}
+    if(sequenceSource==='visual'&&(!state.visualSequencePayload||state.visualSourceKey!==selectedFileKey())){
+      showNote('请先打开可视化排序，完成全部钢筋顺序并保存。',true);return;
+    }
     const options={
       clearance_mm:Number($('clearance').value), axis_simplify_mm:Number($('simplify').value), candidate_axes:['z','y','x'],
       sequence_source:sequenceSource, generate_assembly_paths:$('assemblyEnabled').checked,
@@ -521,6 +738,7 @@
     };
     const form=new FormData();form.append('file',file);
     if(sequenceSource==='excel')form.append('sequence_file',sequenceFile);
+    if(sequenceSource==='visual')form.append('visual_sequence_json',JSON.stringify(state.visualSequencePayload));
     form.append('options_json',JSON.stringify(options));
     $('submitBtn').disabled=true;showNote('正在上传模型…');
     try{
@@ -541,11 +759,53 @@
   // UI events.
   $('sequenceSource').addEventListener('change',e=>{
     $('sequenceUpload').classList.toggle('hidden',e.target.value!=='excel');
+    $('visualSequenceSetup').classList.toggle('hidden',e.target.value!=='visual');
   });
   $('sequenceFile').addEventListener('change',e=>{
     $('sequenceFileLabel').textContent=e.target.files[0]?.name||'选择安装顺序表';
   });
   $('generateSequenceBtn').addEventListener('click',generateSequenceWorkbook);
+  $('visualSequenceBtn').addEventListener('click',loadVisualSequencePreview);
+  $('visualFillBtn').addEventListener('click',fillVisualOrder);
+  $('visualClearBtn').addEventListener('click',clearVisualOrder);
+  $('visualSaveBtn').addEventListener('click',saveVisualOrder);
+  $('visualCloseBtn').addEventListener('click',closeVisualEditor);
+  $('visualSequenceSearch').addEventListener('input',renderVisualSequenceEditor);
+  $('visualAvailableList').addEventListener('click',event=>{
+    const button=event.target.closest('[data-add]');
+    if(button)addVisualBar(Number(button.dataset.add));
+  });
+  $('visualOrderedList').addEventListener('click',event=>{
+    const row=event.target.closest('[data-order-index]');
+    if(!row)return;
+    const from=Number(row.dataset.orderIndex),barIndex=Number(row.dataset.barIndex);
+    const moveButton=event.target.closest('[data-move]');
+    const removeButton=event.target.closest('[data-remove]');
+    if(moveButton){moveVisualBar(from,from+Number(moveButton.dataset.move));return;}
+    if(removeButton){
+      state.visualOrder.splice(from,1);state.visualPreinstalled.delete(barIndex);
+      state.visualSelected=null;state.visualSequencePayload=null;renderVisualSequenceEditor();draw();return;
+    }
+    if(!event.target.matches('input')){state.visualSelected=barIndex;renderVisualSequenceEditor();draw();}
+  });
+  $('visualOrderedList').addEventListener('change',event=>{
+    if(!event.target.matches('[data-installed]'))return;
+    const barIndex=Number(event.target.dataset.installed);
+    if(event.target.checked)state.visualPreinstalled.add(barIndex);else state.visualPreinstalled.delete(barIndex);
+    state.visualSequencePayload=null;renderVisualSequenceEditor();draw();
+  });
+  $('visualOrderedList').addEventListener('dragstart',event=>{
+    const row=event.target.closest('[data-order-index]');
+    state.visualDragIndex=row?Number(row.dataset.orderIndex):null;
+    if(event.dataTransfer)event.dataTransfer.effectAllowed='move';
+  });
+  $('visualOrderedList').addEventListener('dragover',event=>{event.preventDefault();});
+  $('visualOrderedList').addEventListener('drop',event=>{
+    event.preventDefault();
+    const row=event.target.closest('[data-order-index]');
+    if(row&&state.visualDragIndex!==null)moveVisualBar(state.visualDragIndex,Number(row.dataset.orderIndex));
+    state.visualDragIndex=null;
+  });
   $('submitBtn').addEventListener('click',submitTask);
   $('regenBtn').addEventListener('click',regenerateRobot);
   $('fitBtn').addEventListener('click',fitView);
@@ -558,17 +818,24 @@
   $('motionGuideToggle').addEventListener('change',draw);
   $('poseAxesToggle').addEventListener('change',draw);
   $('robotToggle').addEventListener('change',draw);
-  canvas.addEventListener('pointerdown',e=>{state.dragging=true;state.lastX=e.clientX;state.lastY=e.clientY;canvas.setPointerCapture(e.pointerId);});
+  canvas.addEventListener('pointerdown',e=>{
+    state.dragging=true;state.lastX=e.clientX;state.lastY=e.clientY;
+    state.dragStartX=e.clientX;state.dragStartY=e.clientY;canvas.setPointerCapture(e.pointerId);
+  });
   canvas.addEventListener('pointermove',e=>{if(!state.dragging)return;state.yaw+=(e.clientX-state.lastX)*.006;state.pitch=Math.max(-1.45,Math.min(1.45,state.pitch+(e.clientY-state.lastY)*.006));state.lastX=e.clientX;state.lastY=e.clientY;draw();});
-  canvas.addEventListener('pointerup',()=>state.dragging=false);canvas.addEventListener('pointercancel',()=>state.dragging=false);
+  canvas.addEventListener('pointerup',e=>{
+    const moved=Math.hypot(e.clientX-state.dragStartX,e.clientY-state.dragStartY);
+    state.dragging=false;if(moved<5)selectVisualBarAt(e);
+  });
+  canvas.addEventListener('pointercancel',()=>state.dragging=false);
   canvas.addEventListener('wheel',e=>{e.preventDefault();state.zoom=Math.max(.2,Math.min(8,state.zoom*Math.exp(-e.deltaY*.001)));draw();},{passive:false});
   canvas.addEventListener('dblclick',fitView);
   window.addEventListener('resize',draw);
   const dropzone=$('dropzone');
   for(const name of ['dragenter','dragover'])dropzone.addEventListener(name,e=>{e.preventDefault();dropzone.classList.add('drag');});
   for(const name of ['dragleave','drop'])dropzone.addEventListener(name,e=>{e.preventDefault();dropzone.classList.remove('drag');});
-  dropzone.addEventListener('drop',e=>{const files=e.dataTransfer.files;if(files.length){$('fileInput').files=files;$('fileLabel').textContent=files[0].name;updateSequenceGeneratorState();}});
-  $('fileInput').addEventListener('change',e=>{$('fileLabel').textContent=e.target.files[0]?.name||'拖入 IFC 文件或点击选择';updateSequenceGeneratorState();});
+  dropzone.addEventListener('drop',e=>{const files=e.dataTransfer.files;if(files.length){resetVisualSequence();$('fileInput').files=files;$('fileLabel').textContent=files[0].name;updateSequenceGeneratorState();}});
+  $('fileInput').addEventListener('change',e=>{resetVisualSequence();$('fileLabel').textContent=e.target.files[0]?.name||'拖入 IFC 文件或点击选择';updateSequenceGeneratorState();});
 
   updateSequenceGeneratorState();checkHealth();refreshTasks();requestAnimationFrame(animate);
 })();

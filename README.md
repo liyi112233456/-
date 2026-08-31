@@ -7,6 +7,7 @@
 - 从 `IfcFacetedBrep` 弯曲管状实体和 `IfcExtrudedAreaSolid` 直筋实体恢复中心轴；
 - 在 X/Y/Z 正反方向和循环核心任意方向上构造空间拓扑，生成安装顺序；
 - 可上传 Excel/CSV/TSV 人工安装顺序，最简只需一列 `name`，填写 BIM 可对照编号（如 `640520`），按行顺序替代自动拓扑顺序；
+- 可在网页三维模型中点选钢筋、搜索 BIM ID、拖动调整顺序，并标记已安装钢筋，保存后直接进入碰撞计算；
 - Directly parse IfcReinforcingBar products with IfcSweptDiskSolid / IfcCompositeCurve / IfcPolyline / IfcTrimmedCurve geometry, including circular bends, in addition to mapped BREP and extrusion geometry.
 - Generate an editable manual installation-order Excel workbook from an IFC via `POST /api/sequence/generate` or the web page button.
 - In manual-sequence files, `installation_status` can mark bars as `pending` or `preinstalled`; preinstalled bars skip animation and robot-path generation but remain fixed collision obstacles for every pending bar.
@@ -41,7 +42,7 @@ python -m pip install -r requirements.txt
 ## 页面流程
 
 1. 拖入 IFC；
-2. 选择自动多方向拓扑或 Excel 人工顺序，并配置碰撞离散步长；
+2. 选择自动多方向拓扑、Excel 人工顺序或可视化人工顺序，并配置碰撞离散步长；
 3. 后台独立进程执行解析与规划；
 4. SSE 实时显示阶段和进度；
 5. 计算完成后网页自动加载三维模型；
@@ -86,7 +87,7 @@ result_bundle.zip
 
 ## 规划模式说明
 
-第一步 `multi_direction_spatial_topology` 把钢筋表示为带半径中心轴胶囊体，同时检查配置坐标轴的正反扫掠方向；循环核心会补充钢筋端部切线、主方向、径向和斜向候选。自动顺序也可由 Excel 人工顺序完全替代。
+第一步 `multi_direction_spatial_topology` 把钢筋表示为带半径中心轴胶囊体，同时检查配置坐标轴的正反扫掠方向；循环核心会补充钢筋端部切线、主方向、径向和斜向候选。自动顺序也可由 Excel 或网页三维可视化人工顺序完全替代。
 
 第二步 `rigid_rebar_discrete_se3` 按安装顺序把既有钢筋作为动态障碍物，对当前钢筋的三维平移和四元数旋转进行离散碰撞检查。直线进入失败时依次尝试旋转折线路径和 SE(3) RRT 曲线路径。输出会明确区分通过与失败；失败步骤不会写入机器人控制器程序。
 
