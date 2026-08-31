@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>钢筋空间拓扑与机器人施工规划系统</title>
-  <link rel="stylesheet" href="/static/styles.css?v=1.3.0">
+  <title>钢筋空间拓扑规划与碰撞检测系统</title>
+  <link rel="stylesheet" href="/static/styles.css?v=1.4.0">
 </head>
 <body>
   <header class="topbar">
     <div>
       <div class="eyebrow">IFC · TOPOLOGY · ROBOTICS</div>
-      <h1>钢筋空间拓扑与机器人施工规划系统</h1>
+      <h1>钢筋空间拓扑规划与碰撞检测系统</h1>
       <p>多方向空间拓扑、Excel 人工顺序、六自由度安装碰撞检查与机器人轨迹输出</p>
     </div>
     <div class="health" id="healthBadge">服务检查中</div>
@@ -86,6 +86,8 @@
           <div class="viewer-actions">
             <button id="fitBtn" type="button">适配视图</button>
             <label class="check-row small"><input id="ghostToggle" type="checkbox" checked> 最终模型</label>
+            <label class="check-row small"><input id="motionGuideToggle" type="checkbox" checked> 安装轨迹</label>
+            <label class="check-row small"><input id="poseAxesToggle" type="checkbox" checked> 姿态坐标轴</label>
             <label class="check-row small"><input id="robotToggle" type="checkbox" checked> 机器人路径</label>
           </div>
         </div>
@@ -98,6 +100,24 @@
           </div>
           <div class="viewer-overlay top-left" id="viewerInfo">未加载任务</div>
           <div class="viewer-overlay top-right">拖动旋转 · 滚轮缩放 · 双击适配</div>
+          <div class="motion-hud hidden" id="motionHud">
+            <div class="motion-hud-title">
+              <span class="motion-phase" id="motionPhase">等待</span>
+              <strong id="motionPercent">0%</strong>
+            </div>
+            <div class="motion-progress"><i id="motionProgressBar"></i></div>
+            <div class="motion-stats">
+              <span>路径段 <b id="motionSegment">—</b></span>
+              <span>平移 <b id="motionTranslation">—</b></span>
+              <span>转动 <b id="motionRotation">—</b></span>
+            </div>
+          </div>
+          <div class="motion-legend hidden" id="motionLegend">
+            <span><i class="legend-line path"></i>安装轨迹</span>
+            <span><i class="legend-line moving"></i>当前钢筋</span>
+            <span><i class="legend-line target"></i>目标位置</span>
+            <span><i class="legend-line collision"></i>碰撞路径</span>
+          </div>
         </div>
         <div class="player">
           <button id="prevBtn" type="button">◀</button>
@@ -144,6 +164,6 @@
   <footer>
     <span>FastAPI 后台计算服务</span><span>浏览器自包含三维线框渲染器</span><span>ABB · KUKA · UR · CSV</span>
   </footer>
-  <script src="/static/app.js?v=1.3.0"></script>
+  <script src="/static/app.js?v=1.4.0"></script>
 </body>
 </html>

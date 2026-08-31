@@ -16,7 +16,10 @@ def test_index():
     r=client.get('/')
 
     assert r.status_code==200
-    assert '钢筋空间拓扑' in r.text
+    assert '钢筋空间拓扑规划与碰撞检测系统' in r.text
+    assert 'id="motionGuideToggle"' in r.text
+    assert 'id="poseAxesToggle"' in r.text
+    assert 'id="motionHud"' in r.text
 
 def test_sequence_template():
     client=TestClient(app)

@@ -201,6 +201,8 @@
       if (state.currentTask?.id !== taskId) return;
       state.model = model;
       state.barsByIndex = new Map(model.bars.map(b => [b.i, b]));
+      state.assemblyPaths = new Map();
+      state.robotWaypoints = new Map();
       state.step = 0; state.alpha = 0; state.playing = false;
       $('playBtn').textContent = '播放';
       $('stepSlider').max = String(model.sequence.length);
@@ -254,12 +256,15 @@
     return [canvas.width/2+x1*state.baseScale*state.zoom*perspective*2.8, canvas.height/2-y2*state.baseScale*state.zoom*perspective*2.8, z2];
   }
 
-  function drawPolyline(points, color, width, alpha=1, offset=null) {
+  function drawPolyline(points, color, width, alpha=1, offset=null, dash=null) {
     if (!points || points.length < 2) return;
+    ctx.save();
+    if (dash) ctx.setLineDash(dash.map(value=>value*dpr));
     ctx.beginPath();
     const first=rotatePoint(points[0],offset); ctx.moveTo(first[0],first[1]);
     for (let i=1;i<points.length;i++) { const q=rotatePoint(points[i],offset); ctx.lineTo(q[0],q[1]); }
-    ctx.strokeStyle=color; ctx.globalAlpha=alpha; ctx.lineWidth=width*dpr; ctx.stroke(); ctx.globalAlpha=1;
+    ctx.strokeStyle=color; ctx.globalAlpha=alpha; ctx.lineWidth=width*dpr; ctx.stroke();
+    ctx.restore();
   }
 
 
@@ -279,25 +284,139 @@
     return v.map((value,i)=>value+2*(w*uv[i]+uuv[i]));
   }
 
-  function assemblyPoints(bar,path,alpha) {
+  function distance3(a,b) {
+    return Math.hypot(...a.map((value,index)=>b[index]-value));
+  }
+
+  function quaternionAngleDegrees(a,b) {
+    const dot=Math.abs(a.reduce((sum,value,index)=>sum+value*b[index],0));
+    return 2*Math.acos(Math.max(-1,Math.min(1,dot)))*180/Math.PI;
+  }
+
+  function assemblyPose(path,alpha) {
     const poses=path?.control_poses;
-    if(!poses?.length)return bar.p;
-    const scaled=Math.min(1,Math.max(0,alpha))*(poses.length-1);
+    if(!poses?.length)return null;
+    if(poses.length===1){
+      return {position:poses[0].position_mm,quaternion:poses[0].quaternion_xyzw,index:0,local:1,segmentCount:0};
+    }
+    const progress=Math.min(1,Math.max(0,alpha));
+    const scaled=progress*(poses.length-1);
     const index=Math.min(poses.length-2,Math.floor(scaled));
-    const local=poses.length===1?0:scaled-index;
-    const a=poses[Math.max(0,index)],b=poses[Math.max(0,index+1)]||a;
-    const position=a.position_mm.map((value,k)=>value+local*(b.position_mm[k]-value));
-    const q=quaternionSlerp(a.quaternion_xyzw,b.quaternion_xyzw,local);
+    const local=progress>=1?1:scaled-index;
+    const a=poses[index],b=poses[index+1];
+    return {
+      position:a.position_mm.map((value,k)=>value+local*(b.position_mm[k]-value)),
+      quaternion:quaternionSlerp(a.quaternion_xyzw,b.quaternion_xyzw,local),
+      index,local,segmentCount:poses.length-1,
+    };
+  }
+
+  function pathMotionInfo(path,alpha) {
+    const poses=path?.control_poses,frame=assemblyPose(path,alpha);
+    if(!poses?.length||!frame)return null;
+    let translationTotal=0,rotationTotal=0,translationDone=0,rotationDone=0;
+    for(let i=0;i<poses.length-1;i++){
+      const translation=distance3(poses[i].position_mm,poses[i+1].position_mm);
+      const rotation=quaternionAngleDegrees(poses[i].quaternion_xyzw,poses[i+1].quaternion_xyzw);
+      translationTotal+=translation;rotationTotal+=rotation;
+      if(i<frame.index){translationDone+=translation;rotationDone+=rotation;}
+      else if(i===frame.index){translationDone+=translation*frame.local;rotationDone+=rotation*frame.local;}
+    }
+    const currentA=poses[Math.min(frame.index,poses.length-1)];
+    const currentB=poses[Math.min(frame.index+1,poses.length-1)];
+    const segmentTranslation=distance3(currentA.position_mm,currentB.position_mm);
+    const segmentRotation=quaternionAngleDegrees(currentA.quaternion_xyzw,currentB.quaternion_xyzw);
+    let phase='就位',phaseClass='done';
+    if(path.status==='collision_detected'){phase='碰撞路径';phaseClass='collision';}
+    else if(alpha<.9995&&segmentTranslation>.5&&segmentRotation>.5){phase='平移 + 转动';phaseClass='mixed';}
+    else if(alpha<.9995&&segmentRotation>.5){phase='转动';phaseClass='rotation';}
+    else if(alpha<.9995&&segmentTranslation>.5){phase='平移';phaseClass='translation';}
+    return {frame,phase,phaseClass,translationTotal,rotationTotal,translationDone,rotationDone,segmentTranslation,segmentRotation};
+  }
+
+  function assemblyPoints(bar,path,alpha) {
+    const frame=assemblyPose(path,alpha);
+    if(!frame)return bar.p;
     const pivot=path.pivot_local_mm;
     return bar.p.map(point=>{
-      const rotated=rotateByQuaternion(point.map((value,k)=>value-pivot[k]),q);
-      return rotated.map((value,k)=>value+position[k]);
+      const rotated=rotateByQuaternion(point.map((value,k)=>value-pivot[k]),frame.quaternion);
+      return rotated.map((value,k)=>value+frame.position[k]);
     });
   }
+
+  function drawWorldMarker(position,color,radius,label='') {
+    const point=rotatePoint(position);
+    ctx.save();
+    ctx.beginPath();ctx.arc(point[0],point[1],radius*dpr,0,Math.PI*2);
+    ctx.fillStyle=color;ctx.shadowColor=color;ctx.shadowBlur=7*dpr;ctx.fill();
+    ctx.shadowBlur=0;
+    if(label){
+      ctx.font=`${10*dpr}px sans-serif`;ctx.textAlign='left';ctx.textBaseline='middle';
+      const width=ctx.measureText(label).width+10*dpr;
+      ctx.fillStyle='rgba(7,9,11,.82)';ctx.fillRect(point[0]+7*dpr,point[1]-9*dpr,width,18*dpr);
+      ctx.fillStyle=color;ctx.fillText(label,point[0]+12*dpr,point[1]);
+    }
+    ctx.restore();
+  }
+
+  function drawPoseAxes(frame,motion) {
+    if(!$('poseAxesToggle').checked||!frame)return;
+    const origin=frame.position,L=state.span*.055;
+    const axes=[[[L,0,0],'#ff6a6a','X'],[[0,L,0],'#62d69a','Y'],[[0,0,L],'#67a9ff','Z']];
+    const start=rotatePoint(origin);
+    ctx.save();ctx.font=`${10*dpr}px sans-serif`;ctx.textAlign='left';ctx.textBaseline='middle';
+    for(const [axis,color,label] of axes){
+      const rotated=rotateByQuaternion(axis,frame.quaternion);
+      const endWorld=origin.map((value,index)=>value+rotated[index]);
+      const end=rotatePoint(endWorld);
+      ctx.beginPath();ctx.moveTo(start[0],start[1]);ctx.lineTo(end[0],end[1]);
+      ctx.strokeStyle=color;ctx.lineWidth=2*dpr;ctx.stroke();
+      ctx.fillStyle=color;ctx.fillText(label,end[0]+3*dpr,end[1]);
+    }
+    if(motion?.segmentRotation>.5){
+      const label=`↻ ${motion.rotationDone.toFixed(1)}°`;
+      ctx.font=`${11*dpr}px sans-serif`;ctx.textAlign='center';
+      const width=ctx.measureText(label).width+12*dpr;
+      ctx.fillStyle='rgba(79,48,105,.88)';ctx.fillRect(start[0]-width/2,start[1]+13*dpr,width,21*dpr);
+      ctx.fillStyle='#d8b3ff';ctx.fillText(label,start[0],start[1]+23.5*dpr);
+    }
+    ctx.restore();
+  }
+
+  function drawMotionGuide(bar,path,motion) {
+    if(!$('motionGuideToggle').checked||!motion)return;
+    const poses=path.control_poses,trajectory=poses.map(p=>p.position_mm);
+    const pathColor=path.status==='collision_free'?'#69e6ff':'#ff6767';
+    drawPolyline(bar.p,'#60d394',2,.86,null,[7,5]);
+    drawPolyline(trajectory,pathColor,1.5,.72,null,[5,5]);
+    const completed=trajectory.slice(0,motion.frame.index+1);
+    completed.push(motion.frame.position);
+    drawPolyline(completed,path.status==='collision_free'?'#ff9d45':'#ff6767',2.4,.95);
+    for(const pose of poses)drawWorldMarker(pose.position_mm,pathColor,2.2);
+    drawWorldMarker(trajectory[0],pathColor,4,'起点');
+    drawWorldMarker(trajectory[trajectory.length-1],'#60d394',4,'安装位置');
+    drawWorldMarker(motion.frame.position,path.status==='collision_free'?'#ff9d45':'#ff6767',5,'当前位置');
+  }
+
+  function updateMotionHud(path,motion) {
+    const visible=Boolean(path&&motion&&state.step<(state.model?.sequence.length||0));
+    $('motionHud').classList.toggle('hidden',!visible);
+    $('motionLegend').classList.toggle('hidden',!visible||!$('motionGuideToggle').checked);
+    if(!visible)return;
+    const percent=Math.round(Math.min(1,Math.max(0,state.alpha))*100);
+    $('motionPhase').textContent=motion.phase;
+    $('motionPhase').className=`motion-phase ${motion.phaseClass}`;
+    $('motionPercent').textContent=`${percent}%`;
+    $('motionProgressBar').style.width=`${percent}%`;
+    $('motionSegment').textContent=motion.frame.segmentCount?`${motion.frame.index+1} / ${motion.frame.segmentCount}`:'就位点';
+    $('motionTranslation').textContent=`${Math.round(motion.translationDone)} / ${Math.round(motion.translationTotal)} mm`;
+    $('motionRotation').textContent=`${motion.rotationDone.toFixed(1)} / ${motion.rotationTotal.toFixed(1)}°`;
+  }
+
   function draw() {
     resizeCanvas();
     ctx.clearRect(0,0,canvas.width,canvas.height);
-    if (!state.model) return;
+    if (!state.model) { updateMotionHud(null,null); return; }
     const sequence=state.model.sequence;
     if ($('ghostToggle').checked) {
       for (const bar of state.model.bars) drawPolyline(bar.p, '#80909c', .55, .12);
@@ -320,17 +439,22 @@
       if (bar) {
         const path=state.assemblyPaths.get(current.i);
         if(path?.control_poses?.length){
+          const motion=pathMotionInfo(path,state.alpha);
+          drawMotionGuide(bar,path,motion);
           const points=assemblyPoints(bar,path,state.alpha);
           const color=path.status==='collision_free'?'#ff9d45':'#ff6767';
           drawPolyline(points,color,2.6,1);
+          drawPoseAxes(motion?.frame,motion);
+          updateMotionHud(path,motion);
         }else{
           const travel=1.25*(1-state.alpha);
           const offset=current.d.map(x=>-x*travel);
           drawPolyline(bar.p,'#ff9d45',2.6,1,offset);
+          updateMotionHud(null,null);
         }
         if ($('robotToggle').checked) drawRobotPath(current.i);
       }
-    }
+    } else updateMotionHud(null,null);
     drawAxes();
   }
 
@@ -360,8 +484,10 @@
     $('stepText').textContent=`${state.step.toLocaleString('zh-CN')} / ${total.toLocaleString('zh-CN')}`;
     if (state.model && state.step<total) {
       const item=state.model.sequence[state.step],path=state.assemblyPaths.get(item.i);
+      const bar=state.barsByIndex.get(item.i);
+      const barLabel=bar?.n?`钢筋 ${bar.n}`:`钢筋索引 ${item.i}`;
       const pathText=path?` · ${path.path_type} · ${path.status==='collision_free'?'无碰撞':'检测到碰撞'}`:'';
-      $('viewerInfo').textContent=`当前安装：第 ${state.step+1} 根 · 钢筋索引 ${item.i}${pathText}`;
+      $('viewerInfo').textContent=`当前安装：第 ${state.step+1} 根 · ${barLabel}${pathText}`;
     } else if (total) $('viewerInfo').textContent=`安装完成 · ${total.toLocaleString('zh-CN')} 根`;
     else if (initialInstalled) $('viewerInfo').textContent=`模型中的 ${initialInstalled.toLocaleString('zh-CN')} 根钢筋均标记为已安装`;
   }
@@ -428,7 +554,10 @@
   $('nextBtn').addEventListener('click',()=>{if(!state.model)return;state.playing=false;$('playBtn').textContent='播放';state.step=Math.min(state.model.sequence.length,state.step+1);state.alpha=0;updateStepUI();draw();});
   $('stepSlider').addEventListener('input',e=>{state.playing=false;$('playBtn').textContent='播放';state.step=Number(e.target.value);state.alpha=0;updateStepUI();draw();});
   $('speedSelect').addEventListener('change',e=>state.speed=Number(e.target.value));
-  $('ghostToggle').addEventListener('change',draw);$('robotToggle').addEventListener('change',draw);
+  $('ghostToggle').addEventListener('change',draw);
+  $('motionGuideToggle').addEventListener('change',draw);
+  $('poseAxesToggle').addEventListener('change',draw);
+  $('robotToggle').addEventListener('change',draw);
   canvas.addEventListener('pointerdown',e=>{state.dragging=true;state.lastX=e.clientX;state.lastY=e.clientY;canvas.setPointerCapture(e.pointerId);});
   canvas.addEventListener('pointermove',e=>{if(!state.dragging)return;state.yaw+=(e.clientX-state.lastX)*.006;state.pitch=Math.max(-1.45,Math.min(1.45,state.pitch+(e.clientY-state.lastY)*.006));state.lastX=e.clientX;state.lastY=e.clientY;draw();});
   canvas.addEventListener('pointerup',()=>state.dragging=false);canvas.addEventListener('pointercancel',()=>state.dragging=false);

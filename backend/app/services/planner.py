@@ -608,6 +608,7 @@ def save_planning_outputs(
         "bars": [
             {
                 "i": b.index,
+                "n": (str(b.name or "").rsplit(":", 1)[-1].strip() or str(b.name or "")),
                 "r": round(b.radius, 4),
                 "p": np.round(b.axis, 3).tolist(),
             }

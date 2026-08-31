@@ -253,6 +253,7 @@ def test_viewer_starts_with_preinstalled_bars_and_animates_pending_only(tmp_path
     viewer = json.loads((tmp_path / "viewer_model.json").read_text(encoding="utf-8"))
     assert viewer["initial_installed"] == [0]
     assert [row["i"] for row in viewer["sequence"]] == [1]
+    assert [bar["n"] for bar in viewer["bars"]] == ["bar-0", "bar-1"]
 
 
 def test_robot_export_excludes_preinstalled_bars(tmp_path: Path):
