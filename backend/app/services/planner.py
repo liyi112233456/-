@@ -687,6 +687,44 @@ def save_mesh_group_outputs(
     groups = list(resolved.get("groups") or [])
     groups.sort(key=lambda group: int(group.get("installation_step", group.get("step", 0))))
 
+    with (out_dir / "mesh_group_collisions.csv").open(
+        "w", newline="", encoding="utf-8-sig"
+    ) as stream:
+        writer = csv.writer(stream)
+        writer.writerow([
+            "installation_step", "group_id", "group_name", "phase", "phase_label",
+            "moving_bar_index", "moving_bar_bim_id", "obstacle_group_id",
+            "obstacle_bar_index", "obstacle_bar_bim_id",
+            "maximum_collision_distance_mm", "axis_distance_mm",
+            "required_distance_mm", "sample_hit_count", "first_animation_fraction",
+            "last_animation_fraction", "worst_collision_position_mm",
+            "worst_pose_position_mm", "worst_pose_quaternion_xyzw",
+        ])
+        for path in group_paths.get("paths", []):
+            for collision in path.get("collisions", []):
+                pose = collision.get("collision_pose") or {}
+                writer.writerow([
+                    path.get("installation_step", ""),
+                    path.get("group_id", ""),
+                    path.get("name", ""),
+                    collision.get("phase", ""),
+                    collision.get("phase_label", ""),
+                    collision.get("moving_bar_index", ""),
+                    collision.get("moving_bar_bim_id", ""),
+                    collision.get("obstacle_group_id", ""),
+                    collision.get("obstacle_bar_index", ""),
+                    collision.get("obstacle_bar_bim_id", ""),
+                    collision.get("maximum_collision_distance_mm", ""),
+                    collision.get("axis_distance_mm", ""),
+                    collision.get("required_distance_mm", ""),
+                    collision.get("sample_hit_count", 0),
+                    collision.get("first_animation_fraction", ""),
+                    collision.get("last_animation_fraction", ""),
+                    ";".join(str(value) for value in collision.get("collision_position_mm", [])),
+                    ";".join(str(value) for value in pose.get("position_mm", [])),
+                    ";".join(str(value) for value in pose.get("quaternion_xyzw", [])),
+                ])
+
     def group_status(group: dict) -> str:
         if bool(group.get("preinstalled", False)):
             return "preinstalled"
@@ -821,7 +859,7 @@ def save_mesh_group_outputs(
         },
         "output_files": [
             "rebar_axes.json", "mesh_groups.json", "mesh_group_sequence.csv",
-            "mesh_group_paths.json", "viewer_model.json",
+            "mesh_group_paths.json", "mesh_group_collisions.csv", "viewer_model.json",
         ],
     }
     (out_dir / "planning_summary.json").write_text(

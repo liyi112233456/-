@@ -1,3 +1,4 @@
+import csv
 import json
 from pathlib import Path
 
@@ -155,7 +156,7 @@ def test_u_bar_hooks_are_excluded_from_plane_fit_but_axis_is_preserved():
     assert abs(abs(bottom["plane_angle_deg"]) - 180.0) < 1.0e-5
 
 
-def test_full_hook_geometry_participates_in_group_collision():
+def test_full_hook_geometry_participates_in_group_collision(tmp_path: Path):
     obstacle = make_bar(0, [[0, -50, 150], [100, -50, 150]])
     hooked = make_bar(1, [[50, -50, 100], [50, -50, 0], [50, 50, 0]])
     bottom = make_bar(2, [[0, 0, 0], [100, 0, 0]])
@@ -190,7 +191,8 @@ def test_full_hook_geometry_participates_in_group_collision():
     )
     assert result["summary"]["preinstalled_group_count"] == 1
     assert result["summary"]["collision_detected_count"] == 1
-    hit = result["paths"][0]["first_collision"]
+    path = result["paths"][0]
+    hit = path["first_collision"]
     assert hit["phase"] == "vertical_descent"
     assert hit["moving_bar_index"] == 1
     assert hit["moving_segment"] == 0
@@ -201,6 +203,25 @@ def test_full_hook_geometry_participates_in_group_collision():
     assert len(hit["collision_pose"]["position_mm"]) == 3
     assert len(hit["collision_pose"]["quaternion_xyzw"]) == 4
     assert len(hit["collision_position_mm"]) == 3
+    assert len(path["phases"]) == 2
+    assert path["checked_pose_count"] == sum(phase["sample_count"] for phase in path["phases"])
+    assert path["collision_pair_count"] >= 1
+    assert path["collision_sample_hit_count"] >= path["collision_pair_count"]
+    assert path["maximum_collision_distance_mm"] > 0
+    assert path["worst_collision"]["collision_distance_mm"] > 0
+    assert path["worst_collision"]["maximum_collision_distance_mm"] > 0
+    assert "severity" not in path["worst_collision"]
+    assert "severity_label" not in path["worst_collision"]
+    assert result["summary"]["continued_after_collision"] is True
+    save_mesh_group_outputs(tmp_path, bars, {}, {}, resolved, result)
+    with (tmp_path / "mesh_group_collisions.csv").open(
+        newline="", encoding="utf-8-sig"
+    ) as stream:
+        rows = list(csv.DictReader(stream))
+    assert rows
+    assert {row["moving_bar_bim_id"] for row in rows} >= {"640521"}
+    assert max(float(row["maximum_collision_distance_mm"]) for row in rows) > 0
+    assert all(float(row["required_distance_mm"]) > float(row["axis_distance_mm"]) for row in rows)
 
 
 def test_future_groups_are_not_obstacles_and_preinstalled_groups_are_not_simulated():
@@ -228,7 +249,7 @@ def test_future_groups_are_not_obstacles_and_preinstalled_groups_are_not_simulat
     assert result["paths"][1]["status"] == "collision_free"  # final IFC contact is retained
 
 
-def test_prior_group_collision_stops_later_group_evaluation():
+def test_prior_group_collision_does_not_stop_later_group_evaluation():
     bars = [
         make_bar(0, [[0, 0, 50], [100, 0, 50]]),
         make_bar(1, [[0, 0, 0], [100, 0, 0]]),
@@ -253,10 +274,11 @@ def test_prior_group_collision_stops_later_group_evaluation():
         {"clearance_mm": 0, "assembly_translation_step_mm": 10, "assembly_rotation_step_deg": 5},
     )
     assert result["paths"][0]["status"] == "collision_detected"
-    assert result["paths"][1]["status"] == "not_evaluated_due_to_prior_failure"
-    assert result["paths"][1]["blocked_by_group_id"] == "blocked"
-    assert result["summary"]["simulated_group_count"] == 1
-    assert result["summary"]["not_evaluated_group_count"] == 1
+    assert result["paths"][1]["status"] == "collision_free"
+    assert result["paths"][1]["checked_pose_count"] > 0
+    assert result["summary"]["simulated_group_count"] == 2
+    assert result["summary"]["not_evaluated_group_count"] == 0
+    assert result["summary"]["collision_pair_count"] >= 1
 
 
 def test_mesh_group_outputs_drive_group_viewer(tmp_path: Path):
@@ -289,4 +311,9 @@ def test_mesh_group_outputs_drive_group_viewer(tmp_path: Path):
     assert (tmp_path / "mesh_groups.json").is_file()
     assert (tmp_path / "mesh_group_sequence.csv").is_file()
     assert (tmp_path / "mesh_group_paths.json").is_file()
+    collision_csv = tmp_path / "mesh_group_collisions.csv"
+    assert collision_csv.is_file()
+    header = collision_csv.read_text(encoding="utf-8-sig").splitlines()[0]
+    assert "maximum_collision_distance_mm" in header
+    assert "severity" not in header
     assert summary["robot"]["supported"] is False

@@ -11,6 +11,7 @@
 - 可把全部钢筋点选/框选为任意数量的网片组，拖动指定组安装顺序，并整组标记为已安装；
 - 自动识别箱梁纵向和网片主体平面，拟合时排除离面弯钩/弯腿，完整钢筋仍参与动画与碰撞；
 - 按“正上方水平摆放 → 竖直下降到顶面 → 绕箱梁纵轴旋转到 IFC 最终姿态”校核整组刚体路径；
+- 可对已完成的网片组任务直接复用原 IFC、分组、参数和安装顺序创建新计算任务，无需重新框选；
 - Directly parse IfcReinforcingBar products with IfcSweptDiskSolid / IfcCompositeCurve / IfcPolyline / IfcTrimmedCurve geometry, including circular bends, in addition to mapped BREP and extrusion geometry.
 - Generate an editable manual installation-order Excel workbook from an IFC via `POST /api/sequence/generate` or the web page button.
 - In manual-sequence files, `installation_status` can mark bars as `pending` or `preinstalled`; preinstalled bars skip animation and robot-path generation but remain fixed collision obstacles for every pending bar.
@@ -96,6 +97,7 @@ output/rebar_axes.json
 output/mesh_groups.json
 output/mesh_group_sequence.csv
 output/mesh_group_paths.json
+output/mesh_group_collisions.csv
 output/viewer_model.json
 output/planning_summary.json
 result_bundle.zip
@@ -107,7 +109,9 @@ result_bundle.zip
 
 第二步 `rigid_rebar_discrete_se3` 按安装顺序把既有钢筋作为动态障碍物，对当前钢筋的三维平移和四元数旋转进行离散碰撞检查。直线进入失败时依次尝试旋转折线路径和 SE(3) RRT 曲线路径。输出会明确区分通过与失败；失败步骤不会写入机器人控制器程序。
 
-网片模式 `rigid_mesh_group_prescribed_se3` 把同组完整钢筋作为一个不可变形刚体，只校核用户规定的竖直下降和绕纵向固定轴旋转。组内接触忽略，已安装组及此前检查通过的组作为障碍，未来组不参与；路径碰撞时在完整六自由度碰撞姿态停止并报告 BIM ID、阶段和接触点，后续组标记为未评估，不调用 RRT。网片平面只用自动识别的主体段拟合，弯钩不会影响平面角，但始终保留在完整扫掠碰撞中。当前未定义多点夹具和组级 TCP，因此网片模式不输出 ABB/KUKA/UR 程序。
+网片模式 `rigid_mesh_group_prescribed_se3` 把同组完整钢筋作为一个不可变形刚体，只校核用户规定的竖直下降和绕纵向固定轴旋转。组内接触忽略，已安装组及前序组作为障碍，未来组不参与；发现碰撞后仍继续采样当前完整路径及所有后续网片，不调用 RRT。结果按运动钢筋与障碍钢筋直接汇总碰撞距离（胶囊体要求距离减去中心轴实际距离，单位 mm），并在 `mesh_group_collisions.csv` 中输出最大碰撞距离、最深碰撞姿态与接触点，不再划分轻微/中等/严重等级。网片平面只用自动识别的主体段拟合，弯钩不会影响平面角，但始终保留在完整扫掠碰撞中。当前未定义多点夹具和组级 TCP，因此网片模式不输出 ABB/KUKA/UR 程序。
+
+在任务列表中选中已完成、失败或已取消的网片组任务，可点击“沿用原网片分组与顺序重新计算”。系统创建独立的新任务，复用历史任务保存的 IFC、全部网片成员、安装顺序、已安装状态和路径参数，原任务及其结果保持不变。历史任务目录中的输入文件若已被人工清理，则不能复用。
 
 碰撞证书范围是“钢筋中心轴胶囊体 + 给定平移/旋转离散步长”。仅在精确 IFC 终点姿态、且对应最终接触线段对一致时保留设计接触；提前接触仍判为碰撞。混凝土、模板、支架、吊具、夹具、机器人完整连杆、线缆、人员空间、制造误差和弹性变形仍需在 RobotStudio、KUKA.Sim、RoboDK、URSim 或等效平台复核。
 

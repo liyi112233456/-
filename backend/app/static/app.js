@@ -581,6 +581,14 @@
     return ({queued:'排队', running:'计算中', completed:'已完成', failed:'失败', canceled:'已取消'})[status] || status;
   }
 
+  function collisionDistance(value) {
+    return Number(
+      value?.maximum_collision_distance_mm ?? value?.max_penetration_mm ??
+      value?.maximum_penetration_mm ?? value?.collision_distance_mm ??
+      value?.penetration_mm ?? 0
+    );
+  }
+
   async function refreshTasks(selectNewest = false) {
     try {
       state.tasks = await api('/api/tasks');
@@ -650,6 +658,9 @@
     $('progressBar').style.width = `${Math.round((task.progress || 0)*100)}%`;
     $('statusMessage').textContent = task.error || task.message || '';
     $('regenBtn').disabled = task.status !== 'completed' || task.summary?.robot?.supported===false;
+    const canRerunMeshGroups=task.sequence_source==='visual_groups'&&['completed','failed','canceled'].includes(task.status);
+    $('rerunMeshGroupActions').classList.toggle('hidden',!canRerunMeshGroups);
+    $('rerunMeshGroupBtn').disabled=false;
     const s = task.summary;
     $('metricBars').textContent = s?.rebar_count?.toLocaleString('zh-CN') ?? '—';
     $('metricTypes').textContent = s?.type_count?.toLocaleString('zh-CN') ?? '—';
@@ -657,9 +668,13 @@
     const collision = s?.assembly_collision;
     if (collision) {
       const unit=s?.mesh_group_count?'组':'根';
-      $('metricFeasible').textContent = collision.all_paths_collision_free
-        ? `${collision.collision_free_count} ${unit}通过`
-        : `${collision.collision_detected_count} ${unit}碰撞`;
+      if(s?.mesh_group_count&&collision.collision_detected_count){
+        $('metricFeasible').textContent=`${collision.collision_detected_count} ${unit}碰撞 · ${collision.collision_pair_count||0} 对 · 最大碰撞距离 ${collisionDistance(collision).toFixed(2)} mm`;
+      }else{
+        $('metricFeasible').textContent = collision.all_paths_collision_free
+          ? `${collision.collision_free_count} ${unit}通过`
+          : `${collision.collision_detected_count} ${unit}碰撞`;
+      }
       if(collision.not_evaluated_group_count)$('metricFeasible').textContent+=`，${collision.not_evaluated_group_count} ${unit}未评估`;
       const installed=collision.preinstalled_group_count??collision.preinstalled_bar_count;
       if (installed) {
@@ -687,6 +702,7 @@
       ['网片组安装顺序', `/api/tasks/${task.id}/files/mesh_group_sequence.csv`],
       ['网片组定义与拟合', `/api/tasks/${task.id}/files/mesh_groups.json`],
       ['网片组六自由度路径', `/api/tasks/${task.id}/files/mesh_group_paths.json`],
+      ['网片组碰撞距离明细', `/api/tasks/${task.id}/files/mesh_group_collisions.csv`],
       ['钢筋轴线 JSON', `/api/tasks/${task.id}/files/rebar_axes.json`],
       ['规划摘要', `/api/tasks/${task.id}/files/planning_summary.json`],
       ['后台日志', `/api/tasks/${task.id}/log`],
@@ -864,7 +880,7 @@
     }else if(alpha<.9995&&segmentTranslation>.5&&segmentRotation>.5){phase='平移 + 转动';phaseClass='mixed';}
     else if(alpha<.9995&&segmentRotation>.5){phase='转动';phaseClass='rotation';}
     else if(alpha<.9995&&segmentTranslation>.5){phase='平移';phaseClass='translation';}
-    if(path.status==='collision_detected'&&path.first_collision?.phase===phaseDefinition?.name){phase+=` · 碰撞`;phaseClass='collision';}
+    if(path.status==='collision_detected'&&(path.collisions||[]).some(collision=>collision.phase===phaseDefinition?.name)){phase+=` · 已记录碰撞`;phaseClass='collision';}
     return {frame,phase,phaseClass,translationTotal,rotationTotal,translationDone,rotationDone,segmentTranslation,segmentRotation};
   }
 
@@ -1176,19 +1192,16 @@
 
   function drawMeshGroupTask() {
     const sequence=state.model.sequence||[],installedIds=new Set(state.model.initial_installed||[]);
+    const collidedInstalledIds=new Set();
     for(let step=0;step<Math.min(state.step,sequence.length);step++){
       const previous=sequence[step],previousPath=state.groupPaths.get(previous.group_id)||previous;
-      if(previousPath.status==='collision_free')for(const index of previous.bar_indices||[])installedIds.add(index);
+      for(const index of previous.bar_indices||[]){installedIds.add(index);if(previousPath.status==='collision_detected')collidedInstalledIds.add(index);}
     }
     const installed=[...installedIds].map(index=>state.barsByIndex.get(index)).filter(Boolean).sort((a,b)=>barDepth(a)-barDepth(b));
-    for(const bar of installed)drawPolyline(bar.p,'#54a7ff',1.2,.84);
+    for(const bar of installed)drawPolyline(bar.p,collidedInstalledIds.has(bar.i)?'#d97878':'#54a7ff',1.2,.84);
     if(state.step>=sequence.length){updateMotionHud(null,null);return;}
     const current=sequence[state.step],path=state.groupPaths.get(current.group_id)||current;
     if(!path?.control_poses?.length){updateMotionHud(null,null);return;}
-    if(path.status==='not_evaluated_due_to_prior_failure'){
-      for(const index of current.bar_indices||[]){const bar=state.barsByIndex.get(index);if(bar)drawPolyline(bar.p,'#89949d',1,.22,null,[7,5]);}
-      updateMotionHud(null,null);return;
-    }
     const motion=pathMotionInfo(path,state.alpha),color=path.status==='collision_detected'?'#ff6767':'#ff9d45';
     if($('motionGuideToggle').checked){
       const centroid=current.plane_fit?.centroid_mm;
@@ -1204,7 +1217,7 @@
       if($('motionGuideToggle').checked)drawPolyline(bar.p,'#60d394',1,.38,null,[7,5]);
       drawPolyline(assemblyPoints(bar,path,state.alpha),color,2.4,1);
     }
-    const collisionPose=path.first_collision?.collision_pose;
+    const collisionPose=(path.worst_collision||path.first_collision)?.collision_pose;
     if(collisionPose&&$('motionGuideToggle').checked){
       for(const index of current.bar_indices||path.bar_indices||[]){
         const bar=state.barsByIndex.get(index);if(!bar)continue;
@@ -1212,7 +1225,8 @@
         drawPolyline(points,'#ff6767',1.7,.42,null,[5,4]);
       }
     }
-    if(path.first_collision?.collision_position_mm)drawWorldMarker(path.first_collision.collision_position_mm,'#ff6767',6,'碰撞点');
+    const worstCollision=path.worst_collision||path.first_collision;
+    if(worstCollision?.collision_position_mm)drawWorldMarker(worstCollision.collision_position_mm,'#ff6767',6,`碰撞距离 ${collisionDistance(worstCollision).toFixed(2)} mm`);
     drawPoseAxes(motion?.frame,motion);updateMotionHud(path,motion);
   }
 
@@ -1244,10 +1258,8 @@
       if(state.model.assembly_unit==='mesh_group'){
         const item=state.model.sequence[state.step],path=state.groupPaths.get(item.group_id)||item;
         const status=path?.status==='collision_detected'
-          ?`检测到碰撞（${path.first_collision?.phase_label||'路径'}）`
-          :path?.status==='not_evaluated_due_to_prior_failure'
-            ?`未评估（前序 ${path.blocked_by_group_id||'网片组'} 安装失败）`
-            :'无碰撞';
+          ?`记录 ${path.collision_pair_count||0} 对碰撞 · 最大碰撞距离 ${collisionDistance(path).toFixed(2)} mm，继续播放`
+          :'无碰撞';
         $('viewerInfo').textContent=`当前安装：第 ${state.step+1} 组 · ${item.name||item.group_id} · ${(item.bar_indices||[]).length} 根 · ${status}`;
         return;
       }
@@ -1257,8 +1269,10 @@
       const pathText=path?` · ${path.path_type} · ${path.status==='collision_free'?'无碰撞':'检测到碰撞'}`:'';
       $('viewerInfo').textContent=`当前安装：第 ${state.step+1} 根 · ${barLabel}${pathText}`;
     } else if (total) {
-      const groupFailed=state.model?.assembly_unit==='mesh_group'&&state.model.sequence.some(item=>(state.groupPaths.get(item.group_id)||item).status!=='collision_free');
-      $('viewerInfo').textContent=groupFailed?`结果查看结束 · 存在碰撞或未评估网片组`:`安装完成 · ${total.toLocaleString('zh-CN')} ${state.model?.assembly_unit==='mesh_group'?'组':'根'}`;
+      const collisionPaths=state.model?.assembly_unit==='mesh_group'?state.model.sequence.map(item=>state.groupPaths.get(item.group_id)||item).filter(path=>path.status==='collision_detected'):[];
+      const pairCount=collisionPaths.reduce((sum,path)=>sum+Number(path.collision_pair_count||0),0);
+      const maximum=Math.max(0,...collisionPaths.map(collisionDistance));
+      $('viewerInfo').textContent=collisionPaths.length?`模拟完成 · ${collisionPaths.length} 组、${pairCount} 对碰撞 · 最大碰撞距离 ${maximum.toFixed(2)} mm`:`安装完成 · ${total.toLocaleString('zh-CN')} ${state.model?.assembly_unit==='mesh_group'?'组':'根'}`;
     }
     else if (initialInstalled) $('viewerInfo').textContent=`模型中的 ${initialInstalled.toLocaleString('zh-CN')} 根钢筋均标记为已安装`;
   }
@@ -1266,18 +1280,7 @@
   function animate(now) {
     const dt=Math.min(.08,(now-state.lastFrame)/1000);state.lastFrame=now;
     if(state.playing&&state.model&&!state.visualEditorActive){
-      const current=state.model.sequence?.[state.step];
-      const currentPath=state.model.assembly_unit==='mesh_group'&&current?(state.groupPaths.get(current.group_id)||current):null;
-      if(currentPath?.status==='not_evaluated_due_to_prior_failure'){
-        state.playing=false;$('playBtn').textContent='播放';updateStepUI();draw();requestAnimationFrame(animate);return;
-      }
       state.alpha+=dt*state.speed*2.2;
-      if(currentPath?.status==='collision_detected'){
-        const hit=currentPath.first_collision||{};
-        const fallback=(hit.phase==='fixed_axis_rotation'?1:0)+Number(hit.path_fraction||0);
-        const stop=Math.max(0,Math.min(1,Number.isFinite(Number(hit.animation_fraction))?Number(hit.animation_fraction):fallback/2));
-        if(state.alpha>=stop){state.alpha=stop;state.playing=false;$('playBtn').textContent='播放';updateStepUI();draw();requestAnimationFrame(animate);return;}
-      }
       if(state.alpha>=1){state.alpha=0;state.step++;
         if(state.step>=state.model.sequence.length){state.step=state.model.sequence.length;state.playing=false;$('playBtn').textContent='播放';}
         updateStepUI();
@@ -1329,6 +1332,20 @@
     if(!state.currentTask)return;
     const body={linear_speed_mm_s:Number($('regenLinear').value),angular_speed_deg_s:Number($('regenAngular').value),sample_period_s:Number($('samplePeriod').value),outside_margin_mm:Number($('regenMargin').value),preinsert_distance_mm:Number($('regenPre').value),retreat_distance_mm:300,grasp_fraction:.5};
     try{await api(`/api/tasks/${state.currentTask.id}/robot`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});state.robotWaypoints=new Map();subscribeTask(state.currentTask.id);}catch(err){alert(err.message);}
+  }
+
+  async function rerunMeshGroupTask() {
+    if(!state.currentTask)return;
+    const sourceTask=state.currentTask;
+    const button=$('rerunMeshGroupBtn');
+    button.disabled=true;
+    showNote('正在复用原 IFC、网片分组和安装顺序创建新任务…');
+    try{
+      const result=await api(`/api/tasks/${sourceTask.id}/rerun`,{method:'POST'});
+      showNote(`已创建重新计算任务：${result.task_id.slice(0,8)}，原任务保持不变。`);
+      await refreshTasks();
+      await selectTask(result.task_id);
+    }catch(err){showNote(err.message,true);button.disabled=false;}
   }
 
   function showNote(message,error=false){$('uploadNote').textContent=message;$('uploadNote').style.color=error?'var(--danger)':'var(--muted)';}
@@ -1439,6 +1456,7 @@
   $('meshPreviewSlider').addEventListener('input',event=>{state.meshPreviewAlpha=Number(event.target.value)/100;$('meshPreviewPercent').textContent=`${event.target.value}%`;draw();});
   $('submitBtn').addEventListener('click',submitTask);
   $('regenBtn').addEventListener('click',regenerateRobot);
+  $('rerunMeshGroupBtn').addEventListener('click',rerunMeshGroupTask);
   $('fitBtn').addEventListener('click',fitView);
   $('playBtn').addEventListener('click',()=>{if(!state.model)return;if(state.step>=state.model.sequence.length)state.step=0;state.playing=!state.playing;$('playBtn').textContent=state.playing?'暂停':'播放';updateStepUI();});
   $('prevBtn').addEventListener('click',()=>{state.playing=false;$('playBtn').textContent='播放';state.step=Math.max(0,state.step-1);state.alpha=0;updateStepUI();draw();});

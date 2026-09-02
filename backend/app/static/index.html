@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>钢筋空间拓扑规划与碰撞检测系统</title>
-  <link rel="stylesheet" href="/static/styles.css?v=1.6.0">
+  <link rel="stylesheet" href="/static/styles.css?v=1.6.2">
 </head>
 <body>
   <header class="topbar">
@@ -243,6 +243,10 @@
             <p id="statusMessage">请先上传 IFC 模型。</p>
           </div>
           <div id="downloads" class="downloads"></div>
+          <div id="rerunMeshGroupActions" class="hidden">
+            <button class="primary" id="rerunMeshGroupBtn" type="button">沿用原网片分组与顺序重新计算</button>
+            <p class="engineering-note">创建一个新任务并保留原任务结果，无需重新框选、分组或排序。</p>
+          </div>
         </section>
 
         <section class="panel robot-panel">
@@ -266,6 +270,6 @@
   <footer>
     <span>FastAPI 后台计算服务</span><span>浏览器自包含三维线框渲染器</span><span>ABB · KUKA · UR · CSV</span>
   </footer>
-  <script src="/static/app.js?v=1.6.0"></script>
+  <script src="/static/app.js?v=1.6.2"></script>
 </body>
 </html>

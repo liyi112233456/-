@@ -830,9 +830,10 @@ class _GroupCollisionWorld:
         current_rank: int,
         final_contacts: dict[int, dict[tuple[int, int], float]],
         allow_final_contacts: bool,
-    ) -> tuple[bool, Optional[dict], float]:
+    ) -> tuple[bool, list[dict], float]:
         self.pose_checks += 1
         minimum_clearance = math.inf
+        hits_by_bar_pair: dict[tuple[int, int], dict] = {}
         for bar in bars:
             axis = _transformed_axis(bar, pivot, pose)
             for segment_index, (start, end) in enumerate(zip(axis[:-1], axis[1:])):
@@ -868,7 +869,7 @@ class _GroupCollisionWorld:
                         self.a_array[candidate],
                         self.b_array[candidate],
                     )
-                    return False, {
+                    hit = {
                         "moving_bar_index": int(bar.index),
                         "moving_bar_bim_id": self.display_by_bar[int(bar.index)],
                         "moving_group_id": self.group_by_bar[int(bar.index)],
@@ -877,14 +878,21 @@ class _GroupCollisionWorld:
                         "obstacle_bar_bim_id": self.display_by_bar[obstacle],
                         "obstacle_group_id": self.owner_group[candidate],
                         "obstacle_segment": int(self.owner_segment_array[candidate]),
-                        "distance_mm": float(distances[int(local)]),
-                        "required_mm": float(thresholds[int(local)]),
-                        "penetration_mm": float(-clearances[int(local)]),
+                        "axis_distance_mm": float(distances[int(local)]),
+                        "required_distance_mm": float(thresholds[int(local)]),
+                        # Direct overlap distance of the two rebar capsules.
+                        # A larger positive value means a deeper collision.
+                        "collision_distance_mm": float(-clearances[int(local)]),
                         "moving_contact_point_mm": _round_vector(moving_point, 5),
                         "obstacle_contact_point_mm": _round_vector(obstacle_point, 5),
                         "collision_position_mm": _round_vector(0.5 * (moving_point + obstacle_point), 5),
-                    }, minimum_clearance
-        return True, None, minimum_clearance
+                    }
+                    key = (int(bar.index), obstacle)
+                    previous = hits_by_bar_pair.get(key)
+                    if previous is None or hit["collision_distance_mm"] > previous["collision_distance_mm"]:
+                        hits_by_bar_pair[key] = hit
+        hits = list(hits_by_bar_pair.values())
+        return not hits, hits, minimum_clearance
 
 
 def plan_mesh_group_paths(
@@ -917,7 +925,6 @@ def plan_mesh_group_paths(
     rotation_step = math.radians(float(cfg.get("assembly_rotation_step_deg", 7.5)))
     longitudinal = _unit(resolved.get("longitudinal_axis", [1.0, 0.0, 0.0]))
     paths: list[dict] = []
-    blocked_by_failure: Optional[str] = None
 
     def base_path(group: dict) -> dict:
         return {
@@ -937,19 +944,6 @@ def plan_mesh_group_paths(
         bars = [by_index[int(index)] for index in group["bar_indices"]]
         pivot = np.asarray(group["pivot_local_mm"], dtype=float)
         poses = [_pose_from_json(value) for value in group["control_poses"]]
-        if blocked_by_failure is not None:
-            paths.append(
-                {
-                    **base_path(group),
-                    "status": "not_evaluated_due_to_prior_failure",
-                    "blocked_by_group_id": blocked_by_failure,
-                    "phases": [],
-                    "target_contact_pair_count": 0,
-                    "checked_pose_count": 0,
-                    "minimum_clearance_mm": None,
-                }
-            )
-            continue
         contacts = world.final_contacts(bars, rank)
         maximum_sweep_radius = 0.0
         for bar in bars:
@@ -962,6 +956,7 @@ def plan_mesh_group_paths(
         checked = 0
         minimum_clearance = math.inf
         first_collision: Optional[dict] = None
+        collision_records: dict[tuple[str, int, int], dict] = {}
         phase_results: list[dict] = []
         phase_specs = [
             ("vertical_descent", "竖直下降", poses[0], poses[1]),
@@ -977,6 +972,9 @@ def plan_mesh_group_paths(
                 int(math.ceil(maximum_sweep_radius * angle / max(translation_step, EPS))),
             )
             phase_free = True
+            phase_pair_keys: set[tuple[str, int, int]] = set()
+            phase_sample_hit_count = 0
+            phase_max_collision_distance = 0.0
             for sample_index in range(sample_count + 1):
                 fraction = sample_index / sample_count
                 pose = _interpolate(start, end, fraction)
@@ -988,26 +986,81 @@ def plan_mesh_group_paths(
                     float(np.linalg.norm(pose.position - poses[-1].position)) <= 1.0e-7
                     and _pose_angle(pose, poses[-1]) <= 1.0e-8
                 )
-                free, hit, clearance = world.check(
+                free, hits, clearance = world.check(
                     bars, pivot, pose, rank, contacts, allow_contacts
                 )
                 checked += 1
                 minimum_clearance = min(minimum_clearance, clearance)
                 if not free:
                     phase_free = False
-                    first_collision = {
-                        "phase": phase_name,
-                        "phase_label": phase_label,
-                        "sample_index": sample_index,
-                        "sample_count": sample_count,
-                        "path_fraction": fraction,
-                        "animation_fraction": (phase_index + fraction) / len(phase_specs),
-                        "collision_pose": _serialize_pose(
-                            pose.position, pose.quaternion, "碰撞姿态"
-                        ),
-                        **(hit or {}),
-                    }
-                    break
+                    animation_fraction = (phase_index + fraction) / len(phase_specs)
+                    collision_pose = _serialize_pose(
+                        pose.position, pose.quaternion, "碰撞姿态"
+                    )
+                    phase_sample_hit_count += len(hits)
+                    for hit in hits:
+                        observation = {
+                            "phase": phase_name,
+                            "phase_label": phase_label,
+                            "sample_index": sample_index,
+                            "sample_count": sample_count,
+                            "path_fraction": fraction,
+                            "animation_fraction": animation_fraction,
+                            "collision_pose": collision_pose,
+                            **hit,
+                        }
+                        if first_collision is None:
+                            first_collision = dict(observation)
+                        key = (
+                            phase_name,
+                            int(hit["moving_bar_index"]),
+                            int(hit["obstacle_bar_index"]),
+                        )
+                        phase_pair_keys.add(key)
+                        phase_max_collision_distance = max(
+                            phase_max_collision_distance,
+                            float(hit["collision_distance_mm"]),
+                        )
+                        existing = collision_records.get(key)
+                        if existing is None:
+                            collision_records[key] = {
+                                **observation,
+                                "first_sample_index": sample_index,
+                                "first_path_fraction": fraction,
+                                "first_animation_fraction": animation_fraction,
+                                "last_sample_index": sample_index,
+                                "last_path_fraction": fraction,
+                                "last_animation_fraction": animation_fraction,
+                                "sample_hit_count": 1,
+                                "maximum_collision_distance_mm": float(
+                                    hit["collision_distance_mm"]
+                                ),
+                            }
+                        else:
+                            existing["sample_hit_count"] += 1
+                            existing["last_sample_index"] = sample_index
+                            existing["last_path_fraction"] = fraction
+                            existing["last_animation_fraction"] = animation_fraction
+                            if float(hit["collision_distance_mm"]) > float(
+                                existing["maximum_collision_distance_mm"]
+                            ):
+                                first_fields = {
+                                    name: existing[name]
+                                    for name in (
+                                        "first_sample_index",
+                                        "first_path_fraction",
+                                        "first_animation_fraction",
+                                        "sample_hit_count",
+                                        "last_sample_index",
+                                        "last_path_fraction",
+                                        "last_animation_fraction",
+                                    )
+                                }
+                                existing.update(observation)
+                                existing.update(first_fields)
+                                existing["maximum_collision_distance_mm"] = float(
+                                    hit["collision_distance_mm"]
+                                )
             phase_results.append(
                 {
                     "name": phase_name,
@@ -1016,10 +1069,22 @@ def plan_mesh_group_paths(
                     "sample_count": sample_count + 1,
                     "translation_mm": distance,
                     "rotation_deg": math.degrees(angle),
+                    "collision_pair_count": len(phase_pair_keys),
+                    "collision_sample_hit_count": phase_sample_hit_count,
+                    "maximum_collision_distance_mm": phase_max_collision_distance,
                 }
             )
-            if not phase_free:
-                break
+        collisions = sorted(
+            collision_records.values(),
+            key=lambda item: (
+                -float(item["maximum_collision_distance_mm"]),
+                float(item["first_animation_fraction"]),
+            ),
+        )
+        unique_path_pairs = {
+            (int(item["moving_bar_index"]), int(item["obstacle_bar_index"]))
+            for item in collisions
+        }
         status = "collision_free" if first_collision is None else "collision_detected"
         path = {
             **base_path(group),
@@ -1028,34 +1093,65 @@ def plan_mesh_group_paths(
             "target_contact_pair_count": int(sum(len(value) for value in contacts.values())),
             "checked_pose_count": checked,
             "minimum_clearance_mm": None if math.isinf(minimum_clearance) else minimum_clearance,
+            "collision_pair_count": len(unique_path_pairs),
+            "collision_record_count": len(collisions),
+            "collision_sample_hit_count": int(
+                sum(int(item["sample_hit_count"]) for item in collisions)
+            ),
+            "maximum_collision_distance_mm": (
+                float(collisions[0]["maximum_collision_distance_mm"])
+                if collisions else 0.0
+            ),
+            "collisions": collisions,
         }
         if first_collision is not None:
             path["first_collision"] = first_collision
-            blocked_by_failure = str(group["group_id"])
+            path["worst_collision"] = collisions[0]
         paths.append(path)
 
     collision_free = sum(path["status"] == "collision_free" for path in paths)
     failed = sum(path["status"] == "collision_detected" for path in paths)
-    not_evaluated = sum(
-        path["status"] == "not_evaluated_due_to_prior_failure" for path in paths
+    all_collisions = [collision for path in paths for collision in path.get("collisions", [])]
+    unique_collision_pairs = {
+        (
+            str(collision.get("moving_group_id", "")),
+            int(collision["moving_bar_index"]),
+            str(collision.get("obstacle_group_id", "")),
+            int(collision["obstacle_bar_index"]),
+        )
+        for collision in all_collisions
+    }
+    maximum_collision_distance = max(
+        (
+            float(collision["maximum_collision_distance_mm"])
+            for collision in all_collisions
+        ),
+        default=0.0,
     )
     summary = {
         "planner": "rigid_mesh_group_prescribed_se3",
         "mesh_group_count": len(groups),
         "preinstalled_group_count": len(groups) - len(pending),
         "pending_group_count": len(pending),
-        "simulated_group_count": collision_free + failed,
-        "not_evaluated_group_count": not_evaluated,
+        "simulated_group_count": len(pending),
+        "not_evaluated_group_count": 0,
         "collision_free_count": collision_free,
         "collision_detected_count": failed,
-        "all_paths_collision_free": failed == 0 and not_evaluated == 0,
+        "collision_pair_count": len(unique_collision_pairs),
+        "collision_record_count": len(all_collisions),
+        "collision_sample_hit_count": int(
+            sum(int(collision["sample_hit_count"]) for collision in all_collisions)
+        ),
+        "maximum_collision_distance_mm": maximum_collision_distance,
+        "all_paths_collision_free": failed == 0,
+        "continued_after_collision": True,
         "pose_check_count": world.pose_checks,
         "segment_pair_test_count": world.segment_tests,
         "translation_discretization_mm": translation_step,
         "rotation_discretization_deg": math.degrees(rotation_step),
         "collision_model": "complete centerline capsules; same-group contacts ignored; only preinstalled and earlier groups are obstacles",
         "rigid_body_dof": 6,
-        "path_policy": "vertical descent then fixed longitudinal-axis rotation; no RRT fallback",
+        "path_policy": "vertical descent then fixed longitudinal-axis rotation; collision samples are recorded and the full path plus all later groups continue; no RRT fallback",
     }
     return {
         "units": "mm",

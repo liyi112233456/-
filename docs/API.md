@@ -35,6 +35,7 @@
 - `mesh_groups.json`：主体段掩码、拟合残差、平面角、顶面标高和旋转轴；
 - `mesh_group_sequence.csv`：网片组顺序、状态、BIM ID 和成员；
 - `mesh_group_paths.json`：整组共享 `control_poses`、竖降/旋转阶段、碰撞姿态、钢筋 BIM ID 与接触点；
+- `mesh_group_collisions.csv`：碰撞钢筋对、阶段、最大碰撞距离、中心轴实际距离、要求距离、最深碰撞接触点和六自由度姿态；
 - `viewer_model.json`：`assembly_unit=mesh_group`，浏览器按组播放。
 
 ## 重新生成机器人轨迹
@@ -93,7 +94,13 @@
 }
 ```
 
-`model_fingerprint` 必须存在且与本次 IFC 一致。所有钢筋必须恰好属于一个非空组，组 ID 和正整数顺序必须唯一；角度、标高、轴坐标和抬高距离只接受有限数值，`preinstalled` 只接受 JSON 布尔值。`preinstalled` 组从第一帧起作为障碍物且不模拟。空参数由后台求解；人工旋转轴仍必须平行箱梁纵向，平面角限制为 `[-180°, 180°]`。某组发生碰撞后，后续组标记为 `not_evaluated_due_to_prior_failure`，不再假定失败组已经安装。网片组没有单一 TCP，`POST /api/tasks/{id}/robot` 会返回 `409`。
+`model_fingerprint` 必须存在且与本次 IFC 一致。所有钢筋必须恰好属于一个非空组，组 ID 和正整数顺序必须唯一；角度、标高、轴坐标和抬高距离只接受有限数值，`preinstalled` 只接受 JSON 布尔值。`preinstalled` 组从第一帧起作为障碍物且不模拟。空参数由后台求解；人工旋转轴仍必须平行箱梁纵向，平面角限制为 `[-180°, 180°]`。碰撞不会中断模拟：当前网片继续到最终姿态，后续网片也继续检查。碰撞结果直接输出 `collision_distance_mm = required_distance_mm - axis_distance_mm`；该正值表示两个中心轴胶囊体的重叠距离，数值越大表示碰撞越深，不再划分轻微、中等或严重等级。网片组没有单一 TCP，`POST /api/tasks/{id}/robot` 会返回 `409`。
+
+## 复用历史网片任务重新计算
+
+`POST /api/tasks/{id}/rerun`
+
+仅适用于状态为已完成、失败或已取消的 `visual_groups` 任务。接口从历史任务目录复用原始 IFC、网片成员、安装顺序、已安装状态、旋转轴和路径参数，创建新的独立任务并返回 `202`；原任务与原结果不会被覆盖。历史任务的 `input.ifc` 和 `input_sequence.json` 必须仍然存在；兼容部分仅保留 `output/mesh_groups.json` 的旧任务。
 
 ## Excel 顺序模板
 

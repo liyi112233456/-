@@ -30,6 +30,7 @@ def test_index():
     assert 'id="meshConfirmGroupBtn"' in r.text
     assert 'id="meshSolveBtn"' in r.text
     assert 'id="meshPreviewSlider"' in r.text
+    assert 'id="rerunMeshGroupBtn"' in r.text
     assert "框选多根时按模型索引依次追加" in r.text
     for speed in ("0.01", "0.03", "0.05", "0.1"):
         assert f'<option value="{speed}">{speed}×</option>' in r.text
@@ -233,3 +234,82 @@ def test_mesh_group_task_rejects_robot_regeneration(monkeypatch):
     )
     assert response.status_code == 409
     assert "多点夹具" in response.json()["detail"]
+
+
+def test_completed_mesh_group_task_can_rerun_without_regrouping(monkeypatch, tmp_path):
+    source_id = "completed-group-task"
+    source_dir = tmp_path / source_id
+    source_dir.mkdir()
+    (source_dir / "input.ifc").write_bytes(b"saved IFC")
+    group_payload = {
+        "mode": "mesh_groups",
+        "schema_version": 2,
+        "model_fingerprint": "sha256:saved-model",
+        "groups": [{"group_id": "G1", "installation_step": 1, "bar_indices": [0]}],
+    }
+    (source_dir / "input_sequence.json").write_text(
+        json.dumps(group_payload), encoding="utf-8"
+    )
+    source_task = {
+        "id": source_id,
+        "filename": "saved.ifc",
+        "status": "completed",
+        "options": {
+            "sequence_source": "visual_groups",
+            "clearance_mm": 2.0,
+            "assembly_translation_step_mm": 25.0,
+            "assembly_rotation_step_deg": 2.5,
+        },
+    }
+    created = {}
+    launched = {}
+    monkeypatch.setattr(main_module, "JOBS_DIR", tmp_path)
+    monkeypatch.setattr(
+        main_module, "get_task", lambda task_id: source_task if task_id == source_id else None
+    )
+    monkeypatch.setattr(
+        main_module,
+        "create_task",
+        lambda task_id, filename, options: created.update(
+            task_id=task_id, filename=filename, options=options
+        ),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "launch_worker",
+        lambda mode, task_id, config=None: launched.update(mode=mode, task_id=task_id),
+    )
+
+    response = TestClient(app).post(f"/api/tasks/{source_id}/rerun")
+
+    assert response.status_code == 202
+    result = response.json()
+    assert result["source_task_id"] == source_id
+    assert result["reused_mesh_groups"] is True
+    assert result["task_id"] != source_id
+    assert created["filename"] == "saved.ifc"
+    assert created["options"]["sequence_source"] == "visual_groups"
+    assert created["options"]["generate_assembly_paths"] is True
+    assert created["options"]["generate_robot_path"] is False
+    assert launched == {"mode": "planning", "task_id": result["task_id"]}
+    new_dir = tmp_path / result["task_id"]
+    assert (new_dir / "input.ifc").read_bytes() == b"saved IFC"
+    assert json.loads((new_dir / "input_sequence.json").read_text(encoding="utf-8")) == group_payload
+    assert (source_dir / "input_sequence.json").is_file()
+
+
+def test_non_mesh_group_task_cannot_use_mesh_group_rerun(monkeypatch):
+    monkeypatch.setattr(
+        main_module,
+        "get_task",
+        lambda task_id: {
+            "id": task_id,
+            "status": "completed",
+            "options": {"sequence_source": "automatic"},
+        },
+    )
+
+    response = TestClient(app).post("/api/tasks/automatic-task/rerun")
+
+    assert response.status_code == 409
+    assert "可视化网片组" in response.json()["detail"]

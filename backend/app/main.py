@@ -39,7 +39,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     lifespan=lifespan,
     title="钢筋空间拓扑规划与碰撞检测系统",
-    version="1.6.0",
+    version="1.6.2",
     description="IFC 钢筋轴线恢复、多方向空间拓扑、Excel/可视化人工顺序、钢筋网片组刚体安装和六自由度碰撞检查。",
 )
 app.add_middleware(GZipMiddleware, minimum_size=1024)
@@ -57,7 +57,15 @@ def health() -> dict:
 
 
 def public_task(task: dict) -> dict:
-    return {k: task.get(k) for k in ["id", "filename", "status", "stage", "progress", "message", "created_at", "updated_at", "error", "summary"]}
+    result = {
+        k: task.get(k)
+        for k in [
+            "id", "filename", "status", "stage", "progress", "message",
+            "created_at", "updated_at", "error", "summary",
+        ]
+    }
+    result["sequence_source"] = (task.get("options") or {}).get("sequence_source")
+    return result
 
 
 @app.get("/api/tasks")
@@ -158,6 +166,71 @@ async def create_planning_task(
     create_task(task_id, file.filename or "model.ifc", options.model_dump())
     launch_worker("planning", task_id)
     return {"task_id": task_id, "status": "queued", "size_bytes": size}
+
+
+@app.post("/api/tasks/{task_id}/rerun", status_code=202)
+def rerun_mesh_group_task(task_id: str) -> dict:
+    """Create a new calculation from a saved mesh-group task without editing it again."""
+    source_task = get_task(task_id)
+    if not source_task:
+        raise HTTPException(404, "任务不存在")
+    if (source_task.get("options") or {}).get("sequence_source") != "visual_groups":
+        raise HTTPException(409, "只有可视化网片组任务可以复用原分组与顺序重新计算")
+    if source_task.get("status") not in {"completed", "failed", "canceled"}:
+        raise HTTPException(409, "当前任务仍在计算，完成或结束后才能重新计算")
+
+    source_dir = JOBS_DIR / task_id
+    source_ifc = source_dir / "input.ifc"
+    if not source_ifc.is_file():
+        raise HTTPException(409, "历史任务的原始 IFC 已不存在，无法重新计算")
+    sequence_path = source_dir / "input_sequence.json"
+    if not sequence_path.is_file():
+        # Older mesh-group jobs may only retain the resolved output. It has the
+        # same versioned group structure and can be validated by the new worker.
+        sequence_path = source_dir / "output" / "mesh_groups.json"
+    if not sequence_path.is_file():
+        raise HTTPException(409, "历史任务的网片分组与安装顺序已不存在，无法重新计算")
+    try:
+        payload = json.loads(sequence_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("mode") != "mesh_groups":
+            raise ValueError("mode 必须是 mesh_groups")
+        if int(payload.get("schema_version", 0)) != 2:
+            raise ValueError("schema_version 必须是 2")
+        if not isinstance(payload.get("groups"), list) or not payload["groups"]:
+            raise ValueError("groups 必须是非空数组")
+    except Exception as exc:
+        raise HTTPException(409, f"历史任务的网片配置无效: {exc}") from exc
+
+    try:
+        options = PlanningOptions.model_validate(source_task.get("options") or {})
+    except Exception as exc:
+        raise HTTPException(409, f"历史任务的计算参数已不兼容: {exc}") from exc
+    options.sequence_source = "visual_groups"
+    options.generate_assembly_paths = True
+    options.generate_robot_path = False
+
+    new_task_id = uuid.uuid4().hex
+    new_dir = JOBS_DIR / new_task_id
+    new_dir.mkdir(parents=True, exist_ok=False)
+    try:
+        shutil.copy2(source_ifc, new_dir / "input.ifc")
+        (new_dir / "input_sequence.json").write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    except Exception:
+        shutil.rmtree(new_dir, ignore_errors=True)
+        raise
+
+    create_task(new_task_id, source_task.get("filename") or "model.ifc", options.model_dump())
+    launch_worker("planning", new_task_id)
+    return {
+        "task_id": new_task_id,
+        "source_task_id": task_id,
+        "status": "queued",
+        "reused_mesh_groups": True,
+        "message": "已复用原 IFC、网片分组和安装顺序创建新计算任务",
+    }
 
 
 @app.get("/api/templates/installation-sequence")
