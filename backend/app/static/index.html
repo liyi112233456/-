@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>钢筋空间拓扑规划与碰撞检测系统</title>
-  <link rel="stylesheet" href="/static/styles.css?v=1.5.0">
+  <link rel="stylesheet" href="/static/styles.css?v=1.6.0">
 </head>
 <body>
   <header class="topbar">
@@ -33,6 +33,7 @@
             <option value="automatic" selected>自动多方向空间拓扑</option>
             <option value="excel">Excel 人工顺序</option>
             <option value="visual">可视化人工顺序</option>
+            <option value="visual_groups">可视化网片组顺序</option>
           </select>
         </label>
         <div id="sequenceUpload" class="sequence-upload hidden">
@@ -46,6 +47,11 @@
         <div id="visualSequenceSetup" class="sequence-upload hidden">
           <button id="visualSequenceBtn" type="button" disabled>解析 IFC 并打开可视化排序</button>
           <small id="visualSequenceSummary">选择 IFC 后，可在三维模型中点击钢筋并指定安装顺序。</small>
+        </div>
+        <div id="meshGroupSetup" class="sequence-upload hidden">
+          <button id="meshGroupBtn" type="button" disabled>解析 IFC 并划分钢筋网片组</button>
+          <small id="meshGroupSummary">点选或框选钢筋组成网片组，再指定各网片组的安装顺序与旋转参数。</small>
+          <small>网片模式固定执行整组六自由度碰撞检查；因尚未定义多点夹具与 TCP，不生成机器人程序。</small>
         </div>
         <div class="sequence-generator">
           <button id="generateSequenceBtn" type="button" disabled>根据当前 IFC 生成人工顺序 Excel</button>
@@ -137,11 +143,12 @@
       <section class="panel visual-sequence-editor hidden" id="visualSequenceEditor">
         <div class="visual-editor-head">
           <div>
-            <div class="eyebrow">VISUAL SEQUENCE EDITOR</div>
-            <h2>可视化指定钢筋安装顺序</h2>
-            <p>点击三维模型中的钢筋可依次加入，也可在下方搜索后添加。</p>
+            <div class="eyebrow" id="visualEditorEyebrow">VISUAL SEQUENCE EDITOR</div>
+            <h2 id="visualEditorTitle">可视化指定钢筋安装顺序</h2>
+            <p id="visualEditorDescription">可单击钢筋逐根加入，也可开启框选后拖出矩形，一次加入一根或多根钢筋。</p>
           </div>
           <div class="visual-editor-actions">
+            <button id="visualBoxSelectBtn" type="button" aria-pressed="false">框选钢筋</button>
             <button id="visualFillBtn" type="button">全部按模型顺序加入</button>
             <button id="visualClearBtn" type="button">清空</button>
             <button id="visualSaveBtn" type="button" class="primary">保存人工顺序</button>
@@ -150,9 +157,9 @@
         </div>
         <div class="visual-editor-status">
           <strong id="visualEditorProgress">已排序 0 / 0</strong>
-          <span>顺序完整后才能开始计算；“已安装”的钢筋只作为后续碰撞障碍物。</span>
+          <span id="visualEditorHint">框选多根时按模型索引依次追加，之后仍可拖动调整；“已安装”的钢筋只作为后续碰撞障碍物。</span>
         </div>
-        <div class="visual-editor-grid">
+        <div class="visual-editor-grid" id="visualSingleEditor">
           <section class="visual-editor-column">
             <label>查找未排序钢筋<input id="visualSequenceSearch" type="search" placeholder="输入 BIM ID、name 或索引"></label>
             <div class="visual-list-title"><span>未排序钢筋</span><b id="visualAvailableCount">0</b></div>
@@ -161,6 +168,65 @@
           <section class="visual-editor-column">
             <div class="visual-list-title"><span>安装顺序（可拖动调整）</span><b id="visualOrderedCount">0</b></div>
             <div id="visualOrderedList" class="visual-sequence-list ordered"></div>
+          </section>
+        </div>
+
+        <div id="meshGroupEditor" class="mesh-group-editor hidden">
+          <nav class="mesh-stage-nav" aria-label="网片组设置阶段">
+            <button type="button" class="active" data-mesh-stage="grouping"><b>1</b><span>划分网片组</span></button>
+            <button type="button" data-mesh-stage="parameters"><b>2</b><span>顺序与路径参数</span></button>
+            <button type="button" data-mesh-stage="preview"><b>3</b><span>三维路径预览</span></button>
+          </nav>
+
+          <section id="meshGroupingStage" class="mesh-stage">
+            <div class="mesh-grouping-grid">
+              <section class="visual-editor-column">
+                <label>查找未分组钢筋<input id="meshGroupSearch" type="search" placeholder="输入 BIM ID、name 或索引"></label>
+                <div class="visual-list-title"><span>未分组钢筋</span><b id="meshUnassignedCount">0</b></div>
+                <div id="meshUnassignedList" class="visual-sequence-list"></div>
+              </section>
+              <section class="visual-editor-column mesh-draft-panel">
+                <label>当前网片名称<input id="meshDraftName" type="text" maxlength="80" placeholder="例如：左侧腹板"></label>
+                <div class="visual-list-title"><span>当前草稿成员</span><b id="meshDraftCount">0</b></div>
+                <div id="meshDraftList" class="visual-sequence-list compact-list"></div>
+                <div class="mesh-inline-actions">
+                  <button id="meshReassignBtn" type="button">将所选钢筋重新分组</button>
+                  <button id="meshCancelDraftBtn" type="button">取消编辑</button>
+                  <button id="meshConfirmGroupBtn" type="button" class="primary">确认网片组</button>
+                </div>
+              </section>
+              <section class="visual-editor-column">
+                <div class="visual-list-title"><span>已有网片组（常见箱梁约 8 组）</span><b id="meshGroupCount">0</b></div>
+                <div id="meshGroupList" class="mesh-group-list"></div>
+              </section>
+            </div>
+          </section>
+
+          <section id="meshParametersStage" class="mesh-stage hidden">
+            <div class="mesh-global-parameters">
+              <div class="mesh-section-heading"><div><strong>全局坐标与摆放参数</strong><small>纵轴由模型自动识别，可人工修正；旋转轴始终与纵轴平行。</small></div><button id="meshSolveBtn" type="button" class="primary">自动求解参数</button></div>
+              <div class="mesh-parameter-grid global">
+                <label>纵轴 X<input id="meshLongitudinalX" type="number" step="0.001" placeholder="自动"></label>
+                <label>纵轴 Y<input id="meshLongitudinalY" type="number" step="0.001" placeholder="自动"></label>
+                <label>纵轴 Z<input id="meshLongitudinalZ" type="number" step="0.001" placeholder="自动"></label>
+                <label>顶面标高 / mm<input id="meshTopElevation" type="number" step="1" placeholder="自动"></label>
+                <label>默认初始抬高 / mm<input id="meshDefaultClearance" type="number" min="0" step="10" value="800"></label>
+              </div>
+            </div>
+            <div class="mesh-section-heading"><div><strong>网片组安装顺序与参数</strong><small>可拖动或用箭头排序；空白参数会由后台自动拟合。</small></div><b id="meshParameterGroupCount">0 组</b></div>
+            <div id="meshParameterList" class="mesh-parameter-list"></div>
+          </section>
+
+          <section id="meshPreviewStage" class="mesh-stage hidden">
+            <div class="mesh-preview-toolbar">
+              <div><strong>网片组共享六自由度路径</strong><small id="meshPreviewStatus">请先自动求解参数，再选择网片组查看水平初始态、竖直下降和定轴旋转。</small></div>
+              <button id="meshRefreshPreviewBtn" type="button" class="primary">重新求解并预览</button>
+            </div>
+            <div class="mesh-preview-controls">
+              <label>预览网片组<select id="meshPreviewGroup"></select></label>
+              <label class="mesh-preview-slider">安装进度<input id="meshPreviewSlider" type="range" min="0" max="100" value="0"><span id="meshPreviewPercent">0%</span></label>
+            </div>
+            <div id="meshPreviewDetails" class="mesh-preview-details">尚未生成网片路径参数。</div>
           </section>
         </div>
       </section>
@@ -200,6 +266,6 @@
   <footer>
     <span>FastAPI 后台计算服务</span><span>浏览器自包含三维线框渲染器</span><span>ABB · KUKA · UR · CSV</span>
   </footer>
-  <script src="/static/app.js?v=1.5.0"></script>
+  <script src="/static/app.js?v=1.6.0"></script>
 </body>
 </html>

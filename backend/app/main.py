@@ -24,6 +24,7 @@ from .config import JOBS_DIR, MAX_UPLOAD_MB
 from .models import PlanningOptions, RobotPathRequest
 from .services.ifc_geometry import parse_ifc_rebars, rebar_display_id
 from .services.manual_sequence_workbook import build_manual_sequence_workbook
+from .services.mesh_groups import rebar_model_fingerprint, resolve_mesh_groups
 from .task_store import create_task, get_task, init_db, list_tasks
 
 APP_DIR = Path(__file__).resolve().parent
@@ -38,8 +39,8 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     lifespan=lifespan,
     title="钢筋空间拓扑规划与碰撞检测系统",
-    version="1.5.0",
-    description="IFC 钢筋轴线恢复、多方向空间拓扑、Excel 与可视化人工顺序、六自由度安装碰撞检查和机器人 TCP 轨迹输出。",
+    version="1.6.0",
+    description="IFC 钢筋轴线恢复、多方向空间拓扑、Excel/可视化人工顺序、钢筋网片组刚体安装和六自由度碰撞检查。",
 )
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -114,16 +115,37 @@ async def create_planning_task(
                         raise HTTPException(413, "Sequence file exceeds 20 MB")
                     stream.write(chunk)
             size += sequence_size
-        elif options.sequence_source == "visual":
+        elif options.sequence_source in {"visual", "visual_groups"}:
             if not visual_sequence_json:
-                raise HTTPException(400, "可视化人工顺序尚未设置")
+                message = (
+                    "可视化钢筋网片组尚未设置"
+                    if options.sequence_source == "visual_groups"
+                    else "可视化人工顺序尚未设置"
+                )
+                raise HTTPException(400, message)
             try:
                 visual_payload = json.loads(visual_sequence_json)
-                items = visual_payload.get("items") if isinstance(visual_payload, dict) else None
-                if not isinstance(items, list) or not items:
-                    raise ValueError("items 必须是非空数组")
+                if not isinstance(visual_payload, dict):
+                    raise ValueError("JSON 顶层必须是对象")
+                if options.sequence_source == "visual_groups":
+                    if visual_payload.get("mode") != "mesh_groups":
+                        raise ValueError("mode 必须是 mesh_groups")
+                    if int(visual_payload.get("schema_version", 0)) != 2:
+                        raise ValueError("schema_version 必须是 2")
+                    groups = visual_payload.get("groups")
+                    if not isinstance(groups, list) or not groups:
+                        raise ValueError("groups 必须是非空数组")
+                    # Group installation does not have a single-bar TCP/gripper
+                    # definition, so controller exports are intentionally disabled.
+                    options.generate_assembly_paths = True
+                    options.generate_robot_path = False
+                else:
+                    items = visual_payload.get("items")
+                    if not isinstance(items, list) or not items:
+                        raise ValueError("items 必须是非空数组")
             except Exception as exc:
-                raise HTTPException(422, f"可视化人工顺序格式无效: {exc}") from exc
+                label = "可视化钢筋网片组" if options.sequence_source == "visual_groups" else "可视化人工顺序"
+                raise HTTPException(422, f"{label}格式无效: {exc}") from exc
             encoded = json.dumps(visual_payload, ensure_ascii=False, separators=(",", ":"))
             encoded_size = len(encoded.encode("utf-8"))
             if encoded_size > 20 * 1024 * 1024:
@@ -181,15 +203,20 @@ def _save_uploaded_ifc_for_sequence(file: UploadFile, temp_dir: Path) -> tuple[P
 
 
 @app.post("/api/sequence/preview")
-def preview_visual_sequence(file: Annotated[UploadFile, File(...)]) -> dict:
+def preview_visual_sequence(
+    file: Annotated[UploadFile, File(...)],
+    visual_sequence_json: Annotated[str | None, Form()] = None,
+) -> dict:
     """Parse an IFC into the lightweight model used by the visual order editor."""
     temp_dir = Path(tempfile.mkdtemp(prefix="visual_sequence_", dir=JOBS_DIR))
     try:
         input_path, source_name = _save_uploaded_ifc_for_sequence(file, temp_dir)
         rebars, _, ifc_meta = parse_ifc_rebars(input_path)
-        return {
+        fingerprint = rebar_model_fingerprint(rebars)
+        response = {
             "units": "mm",
             "source_filename": source_name,
+            "model_fingerprint": fingerprint,
             "bars": [
                 {
                     "i": bar.index,
@@ -209,6 +236,19 @@ def preview_visual_sequence(file: Annotated[UploadFile, File(...)]) -> dict:
                 "axis_total_length_m": sum(bar.length for bar in rebars) / 1000.0,
             },
         }
+        if visual_sequence_json:
+            try:
+                payload = json.loads(visual_sequence_json)
+            except json.JSONDecodeError as exc:
+                raise HTTPException(422, f"可视化钢筋网片组 JSON 格式无效: {exc}") from exc
+            if not isinstance(payload, dict) or payload.get("mode") != "mesh_groups":
+                raise HTTPException(422, "网片组预览的 mode 必须是 mesh_groups")
+            response["mesh_groups"] = resolve_mesh_groups(
+                rebars,
+                payload,
+                model_fingerprint=fingerprint,
+            )
+        return response
     except HTTPException:
         raise
     except Exception as exc:
@@ -321,6 +361,11 @@ def regenerate_robot(task_id: str, request: RobotPathRequest) -> dict:
         raise HTTPException(404, "任务不存在")
     if task["status"] != "completed":
         raise HTTPException(409, "规划任务尚未完成")
+    if task.get("options", {}).get("sequence_source") == "visual_groups":
+        raise HTTPException(
+            409,
+            "钢筋网片组尚未定义多点夹具和 TCP，当前仅支持组级安装动画与碰撞检测，不能生成机器人程序",
+        )
     config = {
         "robot_linear_speed_mm_s": request.linear_speed_mm_s,
         "robot_angular_speed_deg_s": request.angular_speed_deg_s,

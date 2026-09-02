@@ -17,7 +17,7 @@ class PlanningOptions(BaseModel):
     clearance_mm: float = Field(1.0, ge=-5.0, le=100.0)
     candidate_axes: list[str] = Field(default_factory=lambda: ["z", "y", "x"])
     axis_simplify_mm: float = Field(0.75, ge=0.0, le=20.0)
-    sequence_source: Literal["automatic", "excel", "visual"] = "automatic"
+    sequence_source: Literal["automatic", "excel", "visual", "visual_groups"] = "automatic"
     generate_assembly_paths: bool = True
     assembly_translation_step_mm: float = Field(75.0, gt=1.0, le=1000.0)
     assembly_rotation_step_deg: float = Field(7.5, gt=0.25, le=45.0)

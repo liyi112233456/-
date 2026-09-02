@@ -644,3 +644,187 @@ def save_planning_outputs(
     }
     (out_dir / "planning_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
+
+
+def save_mesh_group_outputs(
+    out_dir: Path,
+    rebars: list[Rebar],
+    type_axes: dict[int, TypeAxis],
+    meta: dict,
+    resolved: dict,
+    group_paths: dict,
+) -> dict:
+    """Write the additive group-mode artifacts without changing legacy formats."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    axes_payload = {
+        "units": "mm",
+        "bars": [
+            {
+                "index": b.index,
+                "entity_id": b.entity_id,
+                "guid": b.guid,
+                "name": b.name,
+                "tag": b.tag,
+                "map_id": b.map_id,
+                "radius_mm": b.radius,
+                "length_mm": b.length,
+                "axis": np.round(b.axis, 5).tolist(),
+            }
+            for b in rebars
+        ],
+    }
+    (out_dir / "rebar_axes.json").write_text(
+        json.dumps(axes_payload, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    (out_dir / "mesh_groups.json").write_text(
+        json.dumps(resolved, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    (out_dir / "mesh_group_paths.json").write_text(
+        json.dumps(group_paths, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    groups = list(resolved.get("groups") or [])
+    groups.sort(key=lambda group: int(group.get("installation_step", group.get("step", 0))))
+
+    def group_status(group: dict) -> str:
+        if bool(group.get("preinstalled", False)):
+            return "preinstalled"
+        return str(group.get("installation_status", group.get("status", "pending")))
+
+    def axis_point(group: dict) -> list[float]:
+        axis = group.get("rotation_axis") or {}
+        return [float(value) for value in axis.get("point_mm", [0.0, 0.0, 0.0])]
+
+    def axis_direction(group: dict) -> list[float]:
+        axis = group.get("rotation_axis") or {}
+        return [float(value) for value in axis.get("direction", resolved.get("longitudinal_axis", [1.0, 0.0, 0.0]))]
+
+    with (out_dir / "mesh_group_sequence.csv").open(
+        "w", newline="", encoding="utf-8-sig"
+    ) as stream:
+        writer = csv.writer(stream)
+        writer.writerow([
+            "installation_step", "installation_status", "preinstalled",
+            "group_id", "group_name", "bar_count", "bar_indices", "bim_ids",
+            "plane_angle_deg", "rotation_axis_point_mm",
+            "rotation_axis_direction", "staging_clearance_mm",
+        ])
+        for group in groups:
+            indices = [int(value) for value in group.get("bar_indices", [])]
+            writer.writerow([
+                int(group.get("installation_step", group.get("step", 0))),
+                group_status(group),
+                int(bool(group.get("preinstalled", False))),
+                group.get("group_id", ""),
+                group.get("name", ""),
+                len(indices),
+                ";".join(str(value) for value in indices),
+                ";".join(str(value) for value in group.get("bim_ids", [])),
+                group.get("plane_angle_deg", ""),
+                ";".join(f"{value:.8f}" for value in axis_point(group)),
+                ";".join(f"{value:.8f}" for value in axis_direction(group)),
+                group.get("staging_clearance_mm", resolved.get("staging_clearance_mm", 800.0)),
+            ])
+
+    preinstalled_groups = [group for group in groups if bool(group.get("preinstalled", False))]
+    pending_groups = [group for group in groups if not bool(group.get("preinstalled", False))]
+    initial_installed = [
+        int(index)
+        for group in preinstalled_groups
+        for index in group.get("bar_indices", [])
+    ]
+
+    def viewer_group(group: dict) -> dict:
+        return {
+            "group_id": group.get("group_id"),
+            "name": group.get("name", ""),
+            "installation_step": int(group.get("installation_step", group.get("step", 0))),
+            "installation_status": group_status(group),
+            "preinstalled": bool(group.get("preinstalled", False)),
+            "bar_indices": [int(value) for value in group.get("bar_indices", [])],
+            "plane_angle_deg": group.get("plane_angle_deg", 0.0),
+            "plane_fit": group.get("plane_fit", {}),
+            "rotation_axis": group.get("rotation_axis", {}),
+            "pivot_local_mm": group.get("pivot_local_mm", [0.0, 0.0, 0.0]),
+            "control_poses": group.get("control_poses", []),
+            "phases": group.get("phases", []),
+        }
+
+    viewer_groups = [viewer_group(group) for group in groups]
+    viewer = {
+        "units": "mm",
+        "assembly_unit": "mesh_group",
+        "model_fingerprint": resolved.get("model_fingerprint"),
+        "frame": group_paths.get("frame", resolved.get("axes", {})),
+        "top_elevation_mm": resolved.get("top_elevation_mm"),
+        "staging_clearance_mm": resolved.get("staging_clearance_mm", 800.0),
+        "bars": [
+            {
+                "i": b.index,
+                "n": rebar_display_id(b),
+                "r": round(b.radius, 4),
+                "p": np.round(b.axis, 3).tolist(),
+            }
+            for b in rebars
+        ],
+        "groups": viewer_groups,
+        "initial_installed": initial_installed,
+        "sequence": [viewer_group(group) for group in pending_groups],
+        "group_paths": group_paths.get("paths", []),
+    }
+    (out_dir / "viewer_model.json").write_text(
+        json.dumps(viewer, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+
+    preinstalled_bar_count = len(initial_installed)
+    bbox_min = np.min([b.bbox_min for b in rebars], axis=0)
+    bbox_max = np.max([b.bbox_max for b in rebars], axis=0)
+    collision_summary = group_paths.get("summary", {})
+    planner_stats = {
+        "planner_mode": "manual_visual_mesh_group_sequence",
+        "sequence_source": "visual_groups",
+        "group_count": len(groups),
+        "preinstalled_group_count": len(preinstalled_groups),
+        "pending_group_count": len(pending_groups),
+        "strict_complete_unique_coverage": True,
+        "certification_scope": (
+            "user-defined rigid mesh groups; feasibility is evaluated only along "
+            "the prescribed vertical-drop and fixed-axis rotation path"
+        ),
+    }
+    summary = {
+        **meta,
+        "rebar_count": len(rebars),
+        "preinstalled_bar_count": preinstalled_bar_count,
+        "simulated_installation_bar_count": len(rebars) - preinstalled_bar_count,
+        "mesh_group_count": len(groups),
+        "preinstalled_mesh_group_count": len(preinstalled_groups),
+        "pending_mesh_group_count": len(pending_groups),
+        "simulated_mesh_group_count": int(collision_summary.get("simulated_group_count", len(pending_groups))),
+        "not_evaluated_mesh_group_count": int(collision_summary.get("not_evaluated_group_count", 0)),
+        "type_count": len(type_axes),
+        "axis_total_length_m": float(sum(b.length for b in rebars) / 1000.0),
+        "diameter_mm": {
+            "min": float(2 * min(b.radius for b in rebars)),
+            "median": float(2 * np.median([b.radius for b in rebars])),
+            "max": float(2 * max(b.radius for b in rebars)),
+        },
+        "bbox_mm": {"min": bbox_min.tolist(), "max": bbox_max.tolist()},
+        "planner": planner_stats,
+        "assembly_collision": collision_summary,
+        "robot": {
+            "supported": False,
+            "reason": "mesh_group_gripper_and_tcp_not_defined",
+            "message": "钢筋网片组尚未定义多点夹具和 TCP，未生成 ABB、KUKA 或 UR 程序。",
+        },
+        "output_files": [
+            "rebar_axes.json", "mesh_groups.json", "mesh_group_sequence.csv",
+            "mesh_group_paths.json", "viewer_model.json",
+        ],
+    }
+    (out_dir / "planning_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return summary

@@ -13,7 +13,16 @@ import numpy as np
 from .config import JOBS_DIR
 from .services.assembly_path import plan_assembly_paths
 from .services.ifc_geometry import Rebar, parse_ifc_rebars
-from .services.planner import plan_installation, save_planning_outputs
+from .services.mesh_groups import (
+    plan_mesh_group_paths,
+    rebar_model_fingerprint,
+    resolve_mesh_groups,
+)
+from .services.planner import (
+    plan_installation,
+    save_mesh_group_outputs,
+    save_planning_outputs,
+)
 from .services.robot_path import generate_robot_outputs
 from .services.sequence_io import load_manual_sequence
 from .task_store import get_task, init_db, update_task
@@ -60,7 +69,30 @@ def run_planning_job(task_id: str) -> None:
             float(options.get("axis_simplify_mm", 0.75)),
             progress=cb,
         )
-        if options.get("sequence_source") in {"excel", "visual"}:
+        group_mode = options.get("sequence_source") == "visual_groups"
+        if group_mode:
+            sequence_path = job_dir / "input_sequence.json"
+            if not sequence_path.is_file():
+                raise ValueError("Exactly one mesh-group sequence JSON file is required")
+            cb("sequence", 0.54, "校验钢筋网片分组、顺序和安装参数")
+            payload = json.loads(sequence_path.read_text(encoding="utf-8"))
+            fingerprint = rebar_model_fingerprint(rebars)
+            resolved_groups = resolve_mesh_groups(
+                rebars,
+                payload,
+                model_fingerprint=fingerprint,
+            )
+            cb("collision", 0.70, "检查网片组竖直下降和定轴旋转路径")
+            mesh_group_paths = plan_mesh_group_paths(rebars, resolved_groups, options)
+            summary = save_mesh_group_outputs(
+                output_dir,
+                rebars,
+                type_axes,
+                meta,
+                resolved_groups,
+                mesh_group_paths,
+            )
+        elif options.get("sequence_source") in {"excel", "visual"}:
             sequence_files = sorted(job_dir.glob("input_sequence.*"))
             if len(sequence_files) != 1:
                 raise ValueError("Exactly one manual sequence file is required")
@@ -74,31 +106,32 @@ def run_planning_job(task_id: str) -> None:
                 progress=cb,
             )
 
-        assembly_paths = None
-        collision_summary = None
-        if (
-            bool(options.get("generate_assembly_paths", True))
-            or bool(options.get("generate_robot_path", True))
-        ):
-            assembly_paths, collision_summary = plan_assembly_paths(
-                output_dir, rebars, sequence, options, progress=cb
-            )
+        if not group_mode:
+            assembly_paths = None
+            collision_summary = None
+            if (
+                bool(options.get("generate_assembly_paths", True))
+                or bool(options.get("generate_robot_path", True))
+            ):
+                assembly_paths, collision_summary = plan_assembly_paths(
+                    output_dir, rebars, sequence, options, progress=cb
+                )
 
-        summary = save_planning_outputs(
-            output_dir, rebars, type_axes, sequence, meta, planner_stats
-        )
-        if collision_summary is not None:
-            summary["assembly_collision"] = collision_summary
-        if bool(options.get("generate_robot_path", True)):
-            robot_summary = generate_robot_outputs(
-                robot_dir,
-                rebars,
-                sequence,
-                options,
-                progress=cb,
-                assembly_paths=assembly_paths,
+            summary = save_planning_outputs(
+                output_dir, rebars, type_axes, sequence, meta, planner_stats
             )
-            summary["robot"] = robot_summary
+            if collision_summary is not None:
+                summary["assembly_collision"] = collision_summary
+            if bool(options.get("generate_robot_path", True)):
+                robot_summary = generate_robot_outputs(
+                    robot_dir,
+                    rebars,
+                    sequence,
+                    options,
+                    progress=cb,
+                    assembly_paths=assembly_paths,
+                )
+                summary["robot"] = robot_summary
         (output_dir / "planning_summary.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -161,6 +194,10 @@ def run_robot_regeneration(task_id: str, config: dict) -> None:
     task = get_task(task_id)
     if not task:
         raise RuntimeError("Task not found")
+    if task.get("options", {}).get("sequence_source") == "visual_groups":
+        raise ValueError(
+            "钢筋网片组尚未定义多点夹具和 TCP，不能生成机器人程序"
+        )
     try:
         update_task(task_id, status="running", stage="robot", progress=0.90, message="按新参数重新生成机器人轨迹")
         rebars, sequence = load_result_rebars(job_dir)

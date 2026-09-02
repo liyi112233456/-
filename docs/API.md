@@ -7,7 +7,7 @@
 - `file`: IFC 文件；
 - `options_json`: `PlanningOptions` JSON；
 - `sequence_file`: 当 `sequence_source=excel` 时必填，支持 `.xlsx`、`.csv`、`.tsv`。
-- `visual_sequence_json`: 当 `sequence_source=visual` 时必填；内容为可视化编辑器生成的完整顺序和 `pending` / `preinstalled` 状态。
+- `visual_sequence_json`: 当 `sequence_source=visual` 或 `visual_groups` 时必填；前者为逐根顺序，后者为完整网片组定义。
 
 返回 `202` 和 `task_id`。后台以独立 Python 进程执行计算。
 
@@ -29,6 +29,13 @@
 - `GET /api/tasks/{id}/files/assembly_path_waypoints.csv`；
 - `GET /api/tasks/{id}/files/robot/tcp_trajectory.csv`
 - `GET /api/tasks/{id}/bundle`
+
+当 `sequence_source=visual_groups` 时，组模式结果为：
+
+- `mesh_groups.json`：主体段掩码、拟合残差、平面角、顶面标高和旋转轴；
+- `mesh_group_sequence.csv`：网片组顺序、状态、BIM ID 和成员；
+- `mesh_group_paths.json`：整组共享 `control_poses`、竖降/旋转阶段、碰撞姿态、钢筋 BIM ID 与接触点；
+- `viewer_model.json`：`assembly_unit=mesh_group`，浏览器按组播放。
 
 ## 重新生成机器人轨迹
 
@@ -59,6 +66,34 @@
 ## 可视化人工顺序
 
 `POST /api/sequence/preview`（`multipart/form-data`）接收 `file`，返回轻量三维钢筋轴线、BIM ID、半径和索引。网页编辑器可通过点选模型或搜索 BIM ID 加入钢筋，支持拖动、上移/下移、移除以及“已安装”标记；保存时必须完整覆盖 IFC 中的全部钢筋，随后以 `sequence_source=visual` 创建任务。
+
+## 可视化网片组顺序
+
+第一次调用 `POST /api/sequence/preview` 只传 `file`，响应包含稳定的 `model_fingerprint`。点选/框选完成分组后，再向同一接口附加 `visual_sequence_json` 可预览主体段、自动纵轴、平面角、顶面、旋转轴和三姿态路径。创建任务时设置 `sequence_source=visual_groups` 并复用同一 JSON：
+
+```json
+{
+  "mode": "mesh_groups",
+  "schema_version": 2,
+  "model_fingerprint": "sha256:...",
+  "longitudinal_axis": null,
+  "vertical_axis": [0, 0, 1],
+  "top_elevation_mm": null,
+  "staging_clearance_mm": 800,
+  "groups": [{
+    "group_id": "G001",
+    "name": "左侧腹板",
+    "installation_step": 1,
+    "installation_status": "pending",
+    "bar_indices": [0, 3, 8],
+    "plane_angle_deg": null,
+    "rotation_axis": {"transverse_mm": null, "elevation_mm": null, "direction": null},
+    "staging_clearance_mm": null
+  }]
+}
+```
+
+`model_fingerprint` 必须存在且与本次 IFC 一致。所有钢筋必须恰好属于一个非空组，组 ID 和正整数顺序必须唯一；角度、标高、轴坐标和抬高距离只接受有限数值，`preinstalled` 只接受 JSON 布尔值。`preinstalled` 组从第一帧起作为障碍物且不模拟。空参数由后台求解；人工旋转轴仍必须平行箱梁纵向，平面角限制为 `[-180°, 180°]`。某组发生碰撞后，后续组标记为 `not_evaluated_due_to_prior_failure`，不再假定失败组已经安装。网片组没有单一 TCP，`POST /api/tasks/{id}/robot` 会返回 `409`。
 
 ## Excel 顺序模板
 
