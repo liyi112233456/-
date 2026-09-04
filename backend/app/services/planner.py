@@ -686,57 +686,101 @@ def save_mesh_group_outputs(
 
     groups = list(resolved.get("groups") or [])
     groups.sort(key=lambda group: int(group.get("installation_step", group.get("step", 0))))
+    group_names = {
+        str(group.get("group_id")): str(group.get("name", ""))
+        for group in groups
+    }
 
     with (out_dir / "mesh_group_collisions.csv").open(
         "w", newline="", encoding="utf-8-sig"
     ) as stream:
         writer = csv.writer(stream)
         writer.writerow([
-            "installation_step", "group_id", "group_name", "phase", "phase_label",
+            "installation_step", "group_id", "group_name", "next_group_id",
+            "phase", "phase_label",
+            "moving_group_id", "moving_group_name",
             "moving_bar_index", "moving_bar_bim_id", "obstacle_group_id",
+            "obstacle_group_name",
             "obstacle_bar_index", "obstacle_bar_bim_id",
-            "maximum_collision_distance_mm", "axis_distance_mm",
+            "collision_distance_mm", "maximum_collision_distance_mm", "axis_distance_mm",
             "required_distance_mm", "sample_hit_count", "first_animation_fraction",
             "last_animation_fraction", "worst_collision_position_mm",
             "worst_pose_position_mm", "worst_pose_quaternion_xyzw",
         ])
+        def write_collision_row(context: dict, collision: dict) -> None:
+            pose = collision.get("collision_pose") or {}
+            context_group_id = str(
+                context.get("group_id")
+                or context.get("pending_group_id")
+                or context.get("first_group_id")
+                or ""
+            )
+            moving_group_id = str(
+                collision.get("moving_group_id", context_group_id)
+            )
+            obstacle_group_id = str(collision.get("obstacle_group_id", ""))
+            writer.writerow([
+                context.get("installation_step", 0),
+                context_group_id,
+                context.get("name", group_names.get(context_group_id, "")),
+                context.get("next_group_id", ""),
+                collision.get("phase", ""),
+                collision.get("phase_label", ""),
+                moving_group_id,
+                collision.get(
+                    "moving_group_name",
+                    group_names.get(moving_group_id, context.get("name", "")),
+                ),
+                collision.get("moving_bar_index", ""),
+                collision.get("moving_bar_bim_id", ""),
+                obstacle_group_id,
+                group_names.get(obstacle_group_id, ""),
+                collision.get("obstacle_bar_index", ""),
+                collision.get("obstacle_bar_bim_id", ""),
+                collision.get("collision_distance_mm", ""),
+                collision.get("maximum_collision_distance_mm", ""),
+                collision.get("axis_distance_mm", ""),
+                collision.get("required_distance_mm", ""),
+                collision.get("sample_hit_count", 0),
+                collision.get("first_animation_fraction", ""),
+                collision.get("last_animation_fraction", ""),
+                ";".join(str(value) for value in collision.get("collision_position_mm", [])),
+                ";".join(str(value) for value in pose.get("position_mm", [])),
+                ";".join(str(value) for value in pose.get("quaternion_xyzw", [])),
+            ])
+
+        initial_preparation = group_paths.get("initial_preparation") or {}
+        initial_context = {
+            **initial_preparation,
+            "installation_step": 0,
+            "group_id": "__initial_preparation__",
+            "name": initial_preparation.get("label", "首片准备旋转"),
+            "next_group_id": initial_preparation.get("target_group_id"),
+        }
+        for collision in initial_preparation.get("collisions", []):
+            write_collision_row(initial_context, collision)
         for path in group_paths.get("paths", []):
             for collision in path.get("collisions", []):
-                pose = collision.get("collision_pose") or {}
-                writer.writerow([
-                    path.get("installation_step", ""),
-                    path.get("group_id", ""),
-                    path.get("name", ""),
-                    collision.get("phase", ""),
-                    collision.get("phase_label", ""),
-                    collision.get("moving_bar_index", ""),
-                    collision.get("moving_bar_bim_id", ""),
-                    collision.get("obstacle_group_id", ""),
-                    collision.get("obstacle_bar_index", ""),
-                    collision.get("obstacle_bar_bim_id", ""),
-                    collision.get("maximum_collision_distance_mm", ""),
-                    collision.get("axis_distance_mm", ""),
-                    collision.get("required_distance_mm", ""),
-                    collision.get("sample_hit_count", 0),
-                    collision.get("first_animation_fraction", ""),
-                    collision.get("last_animation_fraction", ""),
-                    ";".join(str(value) for value in collision.get("collision_position_mm", [])),
-                    ";".join(str(value) for value in pose.get("position_mm", [])),
-                    ";".join(str(value) for value in pose.get("quaternion_xyzw", [])),
-                ])
+                write_collision_row(path, collision)
 
     def group_status(group: dict) -> str:
         if bool(group.get("preinstalled", False)):
             return "preinstalled"
         return str(group.get("installation_status", group.get("status", "pending")))
 
-    def axis_point(group: dict) -> list[float]:
-        axis = group.get("rotation_axis") or {}
-        return [float(value) for value in axis.get("point_mm", [0.0, 0.0, 0.0])]
-
-    def axis_direction(group: dict) -> list[float]:
-        axis = group.get("rotation_axis") or {}
-        return [float(value) for value in axis.get("direction", resolved.get("longitudinal_axis", [1.0, 0.0, 0.0]))]
+    assembly_axis = resolved.get("assembly_rotation_axis") or {}
+    if not assembly_axis and groups:
+        # Backward-compatible writer fallback for already-resolved v2 fixtures.
+        assembly_axis = groups[0].get("rotation_axis") or {}
+    assembly_axis_point = [
+        float(value) for value in assembly_axis.get("point_mm", [0.0, 0.0, 0.0])
+    ]
+    assembly_axis_direction = [
+        float(value)
+        for value in assembly_axis.get(
+            "direction", resolved.get("longitudinal_axis", [1.0, 0.0, 0.0])
+        )
+    ]
 
     with (out_dir / "mesh_group_sequence.csv").open(
         "w", newline="", encoding="utf-8-sig"
@@ -744,9 +788,10 @@ def save_mesh_group_outputs(
         writer = csv.writer(stream)
         writer.writerow([
             "installation_step", "installation_status", "preinstalled",
-            "group_id", "group_name", "bar_count", "bar_indices", "bim_ids",
-            "plane_angle_deg", "rotation_axis_point_mm",
-            "rotation_axis_direction", "staging_clearance_mm",
+            "group_id", "group_name", "source_filename", "bar_count", "bar_indices", "bim_ids",
+            "plane_angle_deg", "assembly_angle_deg",
+            "assembly_rotation_axis_point_mm",
+            "assembly_rotation_axis_direction", "minimum_staging_clearance_mm",
         ])
         for group in groups:
             indices = [int(value) for value in group.get("bar_indices", [])]
@@ -756,13 +801,21 @@ def save_mesh_group_outputs(
                 int(bool(group.get("preinstalled", False))),
                 group.get("group_id", ""),
                 group.get("name", ""),
+                group.get("source_filename", ""),
                 len(indices),
                 ";".join(str(value) for value in indices),
                 ";".join(str(value) for value in group.get("bim_ids", [])),
                 group.get("plane_angle_deg", ""),
-                ";".join(f"{value:.8f}" for value in axis_point(group)),
-                ";".join(f"{value:.8f}" for value in axis_direction(group)),
-                group.get("staging_clearance_mm", resolved.get("staging_clearance_mm", 800.0)),
+                group.get("assembly_angle_deg", ""),
+                ";".join(f"{value:.8f}" for value in assembly_axis_point),
+                ";".join(f"{value:.8f}" for value in assembly_axis_direction),
+                group.get(
+                    "minimum_staging_clearance_mm",
+                    group.get(
+                        "staging_clearance_mm",
+                        resolved.get("staging_clearance_mm", 800.0),
+                    ),
+                ),
             ])
 
     preinstalled_groups = [group for group in groups if bool(group.get("preinstalled", False))]
@@ -781,21 +834,73 @@ def save_mesh_group_outputs(
             "installation_status": group_status(group),
             "preinstalled": bool(group.get("preinstalled", False)),
             "bar_indices": [int(value) for value in group.get("bar_indices", [])],
+            "source_filename": group.get("source_filename", ""),
             "plane_angle_deg": group.get("plane_angle_deg", 0.0),
+            "assembly_angle_deg": group.get("assembly_angle_deg", 0.0),
             "plane_fit": group.get("plane_fit", {}),
-            "rotation_axis": group.get("rotation_axis", {}),
-            "pivot_local_mm": group.get("pivot_local_mm", [0.0, 0.0, 0.0]),
-            "control_poses": group.get("control_poses", []),
-            "phases": group.get("phases", []),
+            "minimum_staging_clearance_mm": group.get(
+                "minimum_staging_clearance_mm",
+                group.get("staging_clearance_mm", resolved.get("staging_clearance_mm", 800.0)),
+            ),
         }
 
     viewer_groups = [viewer_group(group) for group in groups]
+    viewer_sequence = [viewer_group(group) for group in pending_groups]
+    initial_preparation = group_paths.get("initial_preparation") or {}
+    final_restore = group_paths.get("final_restore") or {}
+    if int(resolved.get("schema_version", 2)) >= 4:
+        if (
+            not bool(initial_preparation.get("omitted", True))
+            and initial_preparation.get("control_poses")
+        ):
+            viewer_sequence.insert(0, {
+                "group_id": "__initial_preparation__",
+                "name": initial_preparation.get("label", "首片准备旋转"),
+                "installation_step": 0,
+                "installation_status": "animation_only",
+                "preinstalled": False,
+                "bar_indices": [],
+                "animation_only": True,
+                "assembly_stage": "initial_preparation",
+                "target_group_id": initial_preparation.get("target_group_id"),
+                "moving_group_ids": initial_preparation.get("moving_group_ids", []),
+                "obstacle_group_ids": initial_preparation.get("obstacle_group_ids", []),
+                "control_poses": initial_preparation.get("control_poses", []),
+            })
+        if (
+            not bool(final_restore.get("omitted", True))
+            and final_restore.get("control_poses")
+        ):
+            viewer_sequence.append({
+                "group_id": "__final_restore__",
+                "name": final_restore.get("label", "完整钢筋笼回正至 IFC 姿态"),
+                "installation_step": (
+                    max(
+                        (
+                            int(group.get("installation_step", group.get("step", 0)))
+                            for group in groups
+                        ),
+                        default=0,
+                    )
+                    + 1
+                ),
+                "installation_status": "animation_only",
+                "preinstalled": False,
+                "bar_indices": [],
+                "animation_only": True,
+                "assembly_stage": "final_restore",
+                "moving_group_ids": final_restore.get("moving_group_ids", []),
+                "obstacle_group_ids": [],
+                "control_poses": final_restore.get("control_poses", []),
+            })
     viewer = {
         "units": "mm",
         "assembly_unit": "mesh_group",
+        "schema_version": int(resolved.get("schema_version", 2)),
+        "motion_model": resolved.get("motion_model", "legacy_individual_mesh_group"),
         "model_fingerprint": resolved.get("model_fingerprint"),
         "frame": group_paths.get("frame", resolved.get("axes", {})),
-        "top_elevation_mm": resolved.get("top_elevation_mm"),
+        "assembly_rotation_axis": assembly_axis,
         "staging_clearance_mm": resolved.get("staging_clearance_mm", 800.0),
         "bars": [
             {
@@ -808,8 +913,13 @@ def save_mesh_group_outputs(
         ],
         "groups": viewer_groups,
         "initial_installed": initial_installed,
-        "sequence": [viewer_group(group) for group in pending_groups],
+        "initial_installed_group_ids": [
+            group.get("group_id") for group in preinstalled_groups
+        ],
+        "sequence": viewer_sequence,
+        "initial_preparation": group_paths.get("initial_preparation"),
         "group_paths": group_paths.get("paths", []),
+        "final_restore": group_paths.get("final_restore"),
     }
     (out_dir / "viewer_model.json").write_text(
         json.dumps(viewer, ensure_ascii=False, separators=(",", ":")),
@@ -823,13 +933,17 @@ def save_mesh_group_outputs(
     planner_stats = {
         "planner_mode": "manual_visual_mesh_group_sequence",
         "sequence_source": "visual_groups",
+        "schema_version": int(resolved.get("schema_version", 2)),
+        "motion_model": resolved.get("motion_model", "legacy_individual_mesh_group"),
         "group_count": len(groups),
         "preinstalled_group_count": len(preinstalled_groups),
         "pending_group_count": len(pending_groups),
         "strict_complete_unique_coverage": True,
         "certification_scope": (
-            "user-defined rigid mesh groups; feasibility is evaluated only along "
-            "the prescribed vertical-drop and fixed-axis rotation path"
+            "user-defined rigid mesh groups; collision feasibility is evaluated during "
+            "initial preparation, pending-group vertical descent, and cumulative "
+            "installed-assembly rotation toward the next group; "
+            "the final whole-cage restore rotation is animation-only"
         ),
     }
     summary = {

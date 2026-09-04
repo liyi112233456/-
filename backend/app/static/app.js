@@ -13,12 +13,12 @@
     visualSelected: null, visualBarPayload: null, meshGroupPayload: null, visualSourceKey: null,
     visualDragIndex: null, visualSelection: new Set(),
     visualBoxMode: false, visualBoxStart: null, visualBoxCurrent: null,
-    visualMode: 'bars', groupPaths: new Map(),
+    visualMode: 'bars', groupPaths: new Map(), meshInitialPreparation: null, meshFinalRestore: null,
     meshGroups: [], meshDraftSelection: new Set(), meshEditingGroupId: null,
     meshSelectedGroupId: null, meshGroupSerial: 1, meshDragIndex: null,
     meshStage: 'grouping', meshResolved: null, meshPreviewAlpha: 0, meshRevision: 0,
     loadedResultTaskId: null,
-    meshDefaults: {longitudinalAxis:[1,0,0],verticalAxis:[0,0,1],topElevation:null,clearance:800},
+    meshDefaults: {longitudinalAxis:[1,0,0],verticalAxis:[0,0,1],axisTransverse:null,axisElevation:null,clearance:800},
   };
 
   const meshPalette=['#54a7ff','#ff9d45','#60d394','#c187ff','#ff6f91','#69e6ff','#ffd166','#a8dadc','#f28482','#90be6d','#b8c0ff','#f6bd60'];
@@ -39,17 +39,50 @@
   }
 
   function updateSequenceGeneratorState() {
+    const files=selectedIfcFiles();
+    const multi=usesMultipleMeshIfcFiles();
     const button = $('generateSequenceBtn');
-    if (button) button.disabled = !$('fileInput').files?.[0];
+    if (button) button.disabled = files.length!==1;
     const visualButton = $('visualSequenceBtn');
-    if (visualButton) visualButton.disabled = !$('fileInput').files?.[0];
+    if (visualButton) visualButton.disabled = files.length!==1;
     const meshButton = $('meshGroupBtn');
-    if (meshButton) meshButton.disabled = !$('fileInput').files?.[0];
+    if (meshButton) meshButton.disabled = multi?files.length<2:files.length!==1;
+  }
+
+  function usesMultipleMeshIfcFiles() {
+    return $('sequenceSource').value==='visual_groups'&&$('meshInputMode')?.value==='multiple';
+  }
+
+  function selectedIfcFiles() {
+    return Array.from($('fileInput').files||[]);
+  }
+
+  function appendSelectedIfcFiles(form) {
+    for(const file of selectedIfcFiles())form.append('file',file,file.name);
   }
 
   function selectedFileKey() {
-    const file=$('fileInput').files?.[0];
-    return file?[file.name,file.size,file.lastModified].join(':'):null;
+    const files=selectedIfcFiles();
+    return files.length?[usesMultipleMeshIfcFiles()?'multiple':'single',...files.map(file=>[file.name,file.size,file.lastModified].join(':'))].join('|'):null;
+  }
+
+  function updateIfcFileLabel() {
+    const files=selectedIfcFiles();
+    $('fileLabel').textContent=!files.length
+      ?(usesMultipleMeshIfcFiles()?'拖入或选择多个网片 IFC 文件':'拖入 IFC 文件或点击选择')
+      :(files.length===1?files[0].name:`已选择 ${files.length} 个 IFC：${files[0].name} 等`);
+  }
+
+  function syncIfcInputMode(clearInvalid=false) {
+    const multiple=usesMultipleMeshIfcFiles();
+    const input=$('fileInput');
+    input.multiple=multiple;
+    $('meshInputModeHint').textContent=multiple
+      ?'请选择至少两个 IFC；每个文件中的全部钢筋会自动成为一个网片组，文件坐标必须处于同一工程坐标系。'
+      :'当前方式：选择一个完整 IFC，再用点选或框选划分网片。';
+    $('meshGroupBtn').textContent=multiple?'解析多个 IFC 并自动建立网片组':'解析 IFC 并划分钢筋网片组';
+    if(clearInvalid&&!multiple&&input.files?.length>1){input.value='';resetVisualSequence();}
+    updateIfcFileLabel();updateSequenceGeneratorState();
   }
 
   function resetVisualSequence() {
@@ -60,19 +93,20 @@
     state.visualSelection=new Set();
     state.visualBarPayload=null;state.meshGroupPayload=null;
     state.visualSourceKey=null;
-    state.visualMode='bars';state.groupPaths=new Map();
+    state.visualMode='bars';state.groupPaths=new Map();state.meshInitialPreparation=null;state.meshFinalRestore=null;
     state.meshGroups=[];state.meshDraftSelection=new Set();state.meshEditingGroupId=null;
     state.meshSelectedGroupId=null;state.meshGroupSerial=1;state.meshDragIndex=null;
     state.meshStage='grouping';state.meshResolved=null;state.meshPreviewAlpha=0;state.meshRevision++;
-    state.meshDefaults={longitudinalAxis:[1,0,0],verticalAxis:[0,0,1],topElevation:null,clearance:800};
+    state.meshDefaults={longitudinalAxis:[1,0,0],verticalAxis:[0,0,1],axisTransverse:null,axisElevation:null,clearance:800};
     for(const id of ['meshLongitudinalX','meshLongitudinalY','meshLongitudinalZ']){$(id).value='';$(id).placeholder='自动';}
-    $('meshTopElevation').value='';$('meshTopElevation').placeholder='自动识别';
+    $('meshAxisTransverse').value='';$('meshAxisTransverse').placeholder='自动';
+    $('meshAxisElevation').value='';$('meshAxisElevation').placeholder='自动';
     $('meshDefaultClearance').value='800';
     setVisualBoxMode(false);
     $('visualSequenceEditor').classList.add('hidden');
     $('viewerPlayer').classList.remove('hidden');
     $('visualSequenceSummary').textContent='选择 IFC 后，可在三维模型中点击钢筋并指定安装顺序。';
-    $('meshGroupSummary').textContent='点选或框选钢筋组成网片组，再指定各网片组的安装顺序与旋转参数。';
+    $('meshGroupSummary').textContent='可在完整 IFC 中点选或框选分组，也可让每个独立 IFC 自动成为一个网片组；随后指定安装顺序。';
   }
 
   async function generateSequenceWorkbook() {
@@ -302,7 +336,7 @@
     $('visualEditorEyebrow').textContent=groups?'MESH GROUP ASSEMBLY EDITOR':'VISUAL SEQUENCE EDITOR';
     $('visualEditorTitle').textContent=groups?'可视化划分钢筋网片组并指定安装顺序':'可视化指定钢筋安装顺序';
     $('visualEditorDescription').textContent=groups
-      ?'点选或框选钢筋形成网片草稿，确认分组后设置整组安装顺序、平面角度和纵向旋转轴。'
+      ?'点选或框选钢筋形成网片草稿，确认分组后设置顺序、平面角度和最低抬高；全部网片共用一条纵向旋转中轴。'
       :'可单击钢筋逐根加入，也可开启框选后拖出矩形，一次加入一根或多根钢筋。';
     $('visualClearBtn').textContent=groups?'清空全部网片':'清空';
     $('visualSaveBtn').textContent=groups?'保存网片组顺序':'保存人工顺序';
@@ -372,7 +406,8 @@
     $('meshConfirmGroupBtn').textContent=state.meshEditingGroupId?'保存网片组修改':'确认网片组';
     $('meshGroupList').innerHTML=state.meshGroups.length?state.meshGroups.map((group,index)=>{
       const selected=group.group_id===state.meshSelectedGroupId?' selected':'';
-      return `<article class="mesh-group-card${selected}" data-mesh-group="${escapeHtml(group.group_id)}" style="--group-color:${group.color}"><i></i><div><strong>${escapeHtml(group.name)}</strong><small>${group.bar_indices.length} 根 · 顺序 ${index+1}${group.installation_status==='preinstalled'?' · 已安装':''}</small></div><button type="button" data-mesh-edit="${escapeHtml(group.group_id)}">编辑</button><button type="button" class="remove" data-mesh-delete="${escapeHtml(group.group_id)}">删除</button></article>`;
+      const source=group.source_filename?` · ${escapeHtml(group.source_filename)}`:'';
+      return `<article class="mesh-group-card${selected}" data-mesh-group="${escapeHtml(group.group_id)}" style="--group-color:${group.color}"><i></i><div><strong>${escapeHtml(group.name)}</strong><small>${group.bar_indices.length} 根 · 顺序 ${index+1}${group.installation_status==='preinstalled'?' · 已安装':''}${source}</small></div><button type="button" data-mesh-edit="${escapeHtml(group.group_id)}">编辑</button><button type="button" class="remove" data-mesh-delete="${escapeHtml(group.group_id)}">删除</button></article>`;
     }).join(''):'<div class="visual-sequence-empty">尚未创建网片组；常见箱梁可按八个纵向面划分</div>';
     renderMeshParameterList();
   }
@@ -382,12 +417,10 @@
     $('meshParameterList').innerHTML=state.meshGroups.length?state.meshGroups.map((group,index)=>{
       const automatic=group.resolved_values||{};
       const angle=group.plane_angle_deg??automatic.plane_angle_deg??'';
-      const transverse=group.rotation_axis?.transverse_mm??automatic.axis_transverse_mm??'';
-      const elevation=group.rotation_axis?.elevation_mm??automatic.axis_elevation_mm??'';
-      const clearance=group.staging_clearance_mm??automatic.staging_clearance_mm??'';
+      const clearance=group.staging_clearance_mm??automatic.minimum_staging_clearance_mm??automatic.staging_clearance_mm??'';
       return `<article class="mesh-parameter-card" draggable="true" data-mesh-order-index="${index}" data-mesh-group-id="${escapeHtml(group.group_id)}" style="--group-color:${group.color}">
-        <header><i></i><div><strong><span>${index+1}</span> ${escapeHtml(group.name)}</strong><small>${group.bar_indices.length} 根钢筋</small></div><label><input type="checkbox" data-mesh-field="installation_status" ${group.installation_status==='preinstalled'?'checked':''}> 整组已安装</label><button type="button" data-mesh-move="-1">↑</button><button type="button" data-mesh-move="1">↓</button></header>
-        <div class="mesh-parameter-grid"><label>最终平面角 / °<input type="number" min="-180" max="180" step="0.1" data-mesh-field="plane_angle_deg" value="${angle}"></label><label>旋转轴横向 / mm<input type="number" step="1" data-mesh-field="axis_transverse" value="${transverse}"></label><label>旋转轴标高 / mm<input type="number" step="1" data-mesh-field="axis_elevation" value="${elevation}"></label><label>初始抬高 / mm<input type="number" min="0" step="10" data-mesh-field="staging_clearance_mm" value="${clearance}" placeholder="默认 ${state.meshDefaults.clearance}"></label></div>
+        <header><i></i><div><strong><span>${index+1}</span> ${escapeHtml(group.name)}</strong><small>${group.bar_indices.length} 根钢筋${group.source_filename?' · '+escapeHtml(group.source_filename):''}</small></div><label><input type="checkbox" data-mesh-field="installation_status" ${group.installation_status==='preinstalled'?'checked':''}> 整组已安装</label><button type="button" data-mesh-move="-1">↑</button><button type="button" data-mesh-move="1">↓</button></header>
+        <div class="mesh-parameter-grid"><label>最终平面角 / °<input type="number" min="-180" max="180" step="0.1" data-mesh-field="plane_angle_deg" value="${angle}"></label><label>最低抬高 / mm<input type="number" min="0" step="10" data-mesh-field="staging_clearance_mm" value="${clearance}" placeholder="默认 ${state.meshDefaults.clearance}"></label><div class="mesh-auto-height-note"><strong>实际起点自动加高</strong><small>完整避开累计钢筋笼的旋转扫掠范围</small></div></div>
       </article>`;
     }).join(''):'<div class="visual-sequence-empty">请先完成网片分组</div>';
   }
@@ -416,7 +449,7 @@
       group.name=name;group.bar_indices=indices;
     }else{
       const serial=state.meshGroupSerial++;
-      state.meshGroups.push({group_id:`G${String(serial).padStart(3,'0')}`,name,bar_indices:indices,color:meshPalette[(serial-1)%meshPalette.length],installation_status:'pending',plane_angle_deg:null,rotation_axis:{transverse_mm:null,elevation_mm:null,direction:null},staging_clearance_mm:null});
+      state.meshGroups.push({group_id:`G${String(serial).padStart(3,'0')}`,name,bar_indices:indices,color:meshPalette[(serial-1)%meshPalette.length],installation_status:'pending',plane_angle_deg:null,staging_clearance_mm:null});
     }
     resetMeshDraft();state.visualSelection=new Set();invalidateMeshSolution();
     renderMeshGroupEditor();draw();showNote(`已保存网片组“${name}”。`);
@@ -486,48 +519,62 @@
 
   function buildMeshPayload() {
     const axis=meshVectorInputs();
-    return {mode:'mesh_groups',schema_version:2,model_fingerprint:state.model?.model_fingerprint||'',longitudinal_axis:axis,vertical_axis:[0,0,1],top_elevation_mm:nullableNumber($('meshTopElevation').value),staging_clearance_mm:nullableNumber($('meshDefaultClearance').value)??800,groups:state.meshGroups.map((group,index)=>({group_id:group.group_id,name:group.name,installation_step:index+1,installation_status:group.installation_status,bar_indices:group.bar_indices.slice(),plane_angle_deg:nullableNumber(group.plane_angle_deg),rotation_axis:{transverse_mm:nullableNumber(group.rotation_axis?.transverse_mm),elevation_mm:nullableNumber(group.rotation_axis?.elevation_mm),direction:axis},staging_clearance_mm:nullableNumber(group.staging_clearance_mm)}))};
+    return {mode:'mesh_groups',schema_version:4,motion_model:'pending_group_descent_then_cumulative_rotation',input_mode:usesMultipleMeshIfcFiles()?'multiple_ifc_files':'single_complete_ifc',model_fingerprint:state.model?.model_fingerprint||'',longitudinal_axis:axis,vertical_axis:[0,0,1],clearance_mm:Number($('clearance').value),assembly_translation_step_mm:Number($('collisionTranslation').value),assembly_rotation_step_deg:Number($('collisionRotation').value),assembly_rotation_axis:{transverse_mm:nullableNumber($('meshAxisTransverse').value),elevation_mm:nullableNumber($('meshAxisElevation').value),direction:axis},staging_clearance_mm:nullableNumber($('meshDefaultClearance').value)??800,groups:state.meshGroups.map((group,index)=>({group_id:group.group_id,name:group.name,source_filename:group.source_filename||'',installation_step:index+1,installation_status:group.installation_status,bar_indices:group.bar_indices.slice(),plane_angle_deg:nullableNumber(group.plane_angle_deg),minimum_staging_clearance_mm:nullableNumber(group.staging_clearance_mm)}))};
   }
 
   function applyResolvedMeshGroups(resolved) {
     state.meshResolved=resolved;
     state.meshDefaults.longitudinalAxis=resolved.longitudinal_axis||state.meshDefaults.longitudinalAxis;
     state.meshDefaults.verticalAxis=resolved.vertical_axis||[0,0,1];
-    state.meshDefaults.topElevation=resolved.top_elevation_mm;
-    state.meshDefaults.clearance=resolved.staging_clearance_mm??800;
+    const sharedAxis=resolved.assembly_rotation_axis||resolved.rotation_axis||{};
+    state.meshDefaults.axisTransverse=sharedAxis.transverse_mm??state.meshDefaults.axisTransverse;
+    state.meshDefaults.axisElevation=sharedAxis.elevation_mm??state.meshDefaults.axisElevation;
+    state.meshDefaults.clearance=resolved.minimum_staging_clearance_mm??resolved.staging_clearance_mm??800;
     const axis=state.meshDefaults.longitudinalAxis;
     [$('meshLongitudinalX'),$('meshLongitudinalY'),$('meshLongitudinalZ')].forEach((input,index)=>input.placeholder=`自动 ${Number(axis[index]).toFixed(6)}`);
-    $('meshTopElevation').placeholder=`自动 ${Number(resolved.top_elevation_mm).toFixed(3)}`;
-    $('meshDefaultClearance').value=resolved.staging_clearance_mm??800;
+    $('meshAxisTransverse').placeholder=Number.isFinite(Number(sharedAxis.transverse_mm))?`自动 ${Number(sharedAxis.transverse_mm).toFixed(3)}`:'自动';
+    $('meshAxisElevation').placeholder=Number.isFinite(Number(sharedAxis.elevation_mm))?`自动 ${Number(sharedAxis.elevation_mm).toFixed(3)}`:'自动';
+    $('meshDefaultClearance').value=state.meshDefaults.clearance;
     const byId=new Map((resolved.groups||[]).map(group=>[group.group_id,group]));
     for(const group of state.meshGroups){
       const solved=byId.get(group.group_id);if(!solved)continue;
-      group.resolved_values={plane_angle_deg:solved.plane_angle_deg,axis_transverse_mm:solved.rotation_axis?.transverse_mm,axis_elevation_mm:solved.rotation_axis?.elevation_mm,staging_clearance_mm:solved.staging_clearance_mm};
-      group.rotation_axis={...(group.rotation_axis||{}),direction:solved.rotation_axis?.direction};
+      group.resolved_values={plane_angle_deg:solved.plane_angle_deg,assembly_angle_deg:solved.assembly_angle_deg,minimum_staging_clearance_mm:solved.minimum_staging_clearance_mm??solved.staging_clearance_mm,effective_staging_clearance_mm:solved.effective_staging_clearance_mm};
       group.plane_fit=solved.plane_fit;
     }
-    state.groupPaths=new Map((resolved.groups||[]).map(group=>[group.group_id,group]));
+    const previewPaths=resolved.paths||resolved.steps||resolved.groups||[];
+    state.groupPaths=new Map(previewPaths.map(group=>[group.group_id,group]));
+    state.meshInitialPreparation=resolved.initial_preparation||null;
+    state.meshFinalRestore=resolved.final_restore||null;
     const select=$('meshPreviewGroup');
-    select.innerHTML=(resolved.groups||[]).map(group=>`<option value="${escapeHtml(group.group_id)}">${escapeHtml(group.name)} · ${Number(group.plane_angle_deg).toFixed(1)}°</option>`).join('');
-    if(state.meshSelectedGroupId&&byId.has(state.meshSelectedGroupId))select.value=state.meshSelectedGroupId;
+    const preparationOption=state.meshInitialPreparation?.control_poses?.length
+      ?'<option value="__initial_preparation__">首片准备旋转</option>':'';
+    const restoreOption=state.meshFinalRestore?.control_poses?.length
+      ?'<option value="__final_restore__">整笼回正 · 仅动画</option>':'';
+    const v4Motion=Number(resolved.schema_version)>=4||resolved.motion_model==='pending_group_descent_then_cumulative_rotation';
+    const selectableGroups=v4Motion
+      ?previewPaths.map(path=>byId.get(path.group_id)||path).filter(group=>group?.group_id)
+      :(resolved.groups||[]);
+    const selectableIds=new Set(selectableGroups.map(group=>group.group_id));
+    select.innerHTML=preparationOption+selectableGroups.map(group=>`<option value="${escapeHtml(group.group_id)}">${escapeHtml(group.name)} · ${Number(group.plane_angle_deg).toFixed(1)}°</option>`).join('')+restoreOption;
+    if(state.meshSelectedGroupId&&(selectableIds.has(state.meshSelectedGroupId)||(state.meshSelectedGroupId==='__initial_preparation__'&&preparationOption)||(state.meshSelectedGroupId==='__final_restore__'&&restoreOption)))select.value=state.meshSelectedGroupId;
     else state.meshSelectedGroupId=select.value||null;
     renderMeshGroupEditor();renderMeshPreviewDetails();draw();
   }
 
   async function solveMeshGroups(openPreview=true) {
     const error=meshCoverageError();if(error){showNote(error,true);return false;}
-    const file=$('fileInput').files[0];if(!file){showNote('请选择 IFC 文件。',true);return false;}
+    const files=selectedIfcFiles();if(!files.length){showNote('请选择 IFC 文件。',true);return false;}
     let requestPayload;
     try{requestPayload=buildMeshPayload();}catch(err){showNote(err.message,true);return false;}
     const revision=state.meshRevision;
-    const form=new FormData();form.append('file',file);form.append('visual_sequence_json',JSON.stringify(requestPayload));
-    $('meshSolveBtn').disabled=true;$('meshRefreshPreviewBtn').disabled=true;showNote('正在识别纵轴、剔除弯头并求解网片平面与旋转轴…');
+    const form=new FormData();appendSelectedIfcFiles(form);form.append('visual_sequence_json',JSON.stringify(requestPayload));
+    $('meshSolveBtn').disabled=true;$('meshRefreshPreviewBtn').disabled=true;showNote('正在识别纵轴、剔除弯头并求解网片平面与共用中轴…');
     try{
       const response=await api('/api/sequence/preview',{method:'POST',body:form});
       if(state.meshRevision!==revision){showNote('求解期间分组或参数已改变，本次旧结果已忽略；请重新求解。',true);return false;}
       applyResolvedMeshGroups(response.mesh_groups||response);
       if(openPreview)setMeshStage('preview');
-      showNote('网片参数已求解；请检查主体段、水平初始态和旋转轴预览。');return true;
+      showNote('网片参数已求解；请检查首片准备、当前片水平下降、累计整体转向下一片和共用中轴。');return true;
     }catch(err){showNote(err.message,true);return false;}
     finally{$('meshSolveBtn').disabled=false;$('meshRefreshPreviewBtn').disabled=false;}
   }
@@ -542,29 +589,66 @@
   }
 
   async function loadMeshGroupPreview() {
-    const file=$('fileInput').files[0];if(!file){showNote('请先选择 IFC 文件。',true);return;}
+    const files=selectedIfcFiles();if(!files.length){showNote('请先选择 IFC 文件。',true);return;}
+    if(usesMultipleMeshIfcFiles()&&files.length<2){showNote('多 IFC 自动分组方式请至少选择两个 IFC 文件。',true);return;}
     if(state.visualSourceKey===selectedFileKey()&&state.model?.bars?.length){state.visualMode='groups';showVisualEditor();renderMeshGroupEditor();draw();return;}
-    const form=new FormData();form.append('file',file);$('meshGroupBtn').disabled=true;showNote('正在解析 IFC 并生成可分组三维模型…');
+    const form=new FormData();appendSelectedIfcFiles(form);$('meshGroupBtn').disabled=true;showNote(usesMultipleMeshIfcFiles()?`正在合并解析 ${files.length} 个 IFC，并按文件自动建立网片组…`:'正在解析 IFC 并生成可分组三维模型…');
     try{
       const model=await api('/api/sequence/preview',{method:'POST',body:form});
       if(state.eventSource){state.eventSource.close();state.eventSource=null;}
       state.currentTask=null;renderTaskList();state.model=model;state.barsByIndex=new Map(model.bars.map(bar=>[bar.i,bar]));
       state.assemblyPaths=new Map();state.groupPaths=new Map();state.robotWaypoints=new Map();state.step=0;state.alpha=0;state.playing=false;
-      state.visualMode='groups';state.visualSourceKey=selectedFileKey();state.visualEditorActive=true;state.visualSelection=new Set();state.meshGroups=[];resetMeshDraft();state.meshResolved=null;state.visualBarPayload=null;state.meshGroupPayload=null;state.meshRevision++;
+      state.visualMode='groups';state.visualSourceKey=selectedFileKey();state.visualEditorActive=true;state.visualSelection=new Set();
+      const suggested=usesMultipleMeshIfcFiles()?(model.suggested_mesh_groups||[]):[];
+      state.meshGroups=suggested.map((group,index)=>({group_id:group.group_id||`G${String(index+1).padStart(3,'0')}`,name:group.name||`网片组 ${index+1}`,source_filename:group.source_filename||'',installation_status:group.installation_status||'pending',bar_indices:(group.bar_indices||[]).slice(),plane_angle_deg:null,staging_clearance_mm:null,color:meshPalette[index%meshPalette.length]}));
+      state.meshGroupSerial=state.meshGroups.length+1;resetMeshDraft();state.meshResolved=null;state.visualBarPayload=null;state.meshGroupPayload=null;state.meshRevision++;
       configureVisualEditorMode();setVisualBoxMode(false);$('visualSequenceEditor').classList.remove('hidden');$('viewerPlayer').classList.add('hidden');$('emptyState').classList.add('hidden');
       $('metricBars').textContent=model.bars.length.toLocaleString('zh-CN');$('metricTypes').textContent=(model.meta?.axis_type_count||0).toLocaleString('zh-CN');$('metricLength').textContent=(model.meta?.axis_total_length_m||0).toFixed(1)+' m';$('metricFeasible').textContent='待划分网片';$('metricFeasible').style.color='var(--orange)';
-      computeBounds();fitView();setMeshStage('grouping');renderMeshGroupEditor();$('meshGroupSummary').textContent=`已解析 ${model.bars.length.toLocaleString('zh-CN')} 根钢筋，等待完整分组。`;showNote('模型已加载：点选或开启框选形成第一个网片组。');
+      computeBounds();fitView();setMeshStage(suggested.length?'parameters':'grouping');renderMeshGroupEditor();
+      if(suggested.length){$('meshGroupSummary').textContent=`已从 ${files.length} 个 IFC 识别 ${model.bars.length.toLocaleString('zh-CN')} 根钢筋并自动建立 ${suggested.length} 个网片组。`;showNote('已按 IFC 文件自动分组；请调整组名、安装顺序、已安装状态和路径参数。');}
+      else{$('meshGroupSummary').textContent=`已解析 ${model.bars.length.toLocaleString('zh-CN')} 根钢筋，等待完整分组。`;showNote('模型已加载：点选或开启框选形成第一个网片组。');}
     }catch(err){showNote(err.message,true);}finally{updateSequenceGeneratorState();}
   }
 
   function renderMeshPreviewDetails() {
-    const group=(state.meshResolved?.groups||[]).find(item=>item.group_id===state.meshSelectedGroupId)||state.meshResolved?.groups?.[0];
+    if(state.meshSelectedGroupId==='__initial_preparation__'&&state.meshInitialPreparation?.control_poses?.length){
+      $('meshPreviewGroup').value='__initial_preparation__';
+      const preparation=state.meshInitialPreparation;
+      const firstId=preparation.next_group_id||preparation.pending_group_id||preparation.obstacle_group_ids?.[0];
+      const firstGroup=(state.meshResolved?.groups||[]).find(item=>item.group_id===firstId);
+      const shared=state.meshResolved?.assembly_rotation_axis||{};
+      const collisionText=preparation.status==='collision_detected'
+        ?`碰撞距离 ${collisionDistance(preparation).toFixed(2)} mm`
+        :'未记录碰撞';
+      $('meshPreviewStatus').textContent=`首片准备：初始已安装整体旋转到“${firstGroup?.name||firstId||'首片'}”的水平装配角；首片在安全高位保持水平不动。`;
+      $('meshPreviewDetails').innerHTML=`<strong>首片准备旋转</strong><span>首片 ${escapeHtml(firstGroup?.name||firstId||'—')}</span><span>运动组 ${(preparation.moving_group_ids||[]).map(meshGroupDisplayName).join('、')||'—'}</span><span>障碍组 ${(preparation.obstacle_group_ids||[]).map(meshGroupDisplayName).join('、')||'—'}</span><span>装配角 ${Number(preparation.assembly_angle_start_deg??preparation.current_assembly_angle_deg??0).toFixed(1)}° → ${Number(preparation.assembly_angle_target_deg??preparation.next_assembly_angle_deg??0).toFixed(1)}°</span><span>共用中轴 T=${Number(shared.transverse_mm||0).toFixed(1)} mm，Z=${Number(shared.elevation_mm||0).toFixed(1)} mm</span><em>${escapeHtml(collisionText)}</em>`;
+      return;
+    }
+    if(state.meshSelectedGroupId==='__final_restore__'&&state.meshFinalRestore?.control_poses?.length){
+      $('meshPreviewGroup').value='__final_restore__';
+      $('meshPreviewStatus').textContent='全部网片安装完成后，整个钢筋笼绕共用纵向中轴回正至 IFC 最终姿态；此阶段只播放动画，不做碰撞检查。';
+      const shared=state.meshResolved?.assembly_rotation_axis||{};
+      $('meshPreviewDetails').innerHTML=`<strong>整笼回正</strong><span>旋转 ${Number(state.meshFinalRestore.rotation_deg||0).toFixed(1)}°</span><span>共用中轴 T=${Number(shared.transverse_mm||0).toFixed(1)} mm，Z=${Number(shared.elevation_mm||0).toFixed(1)} mm</span><em>collision_checked = false</em>`;
+      return;
+    }
+    const firstPendingId=(state.meshResolved?.paths||state.meshResolved?.steps||[])[0]?.group_id;
+    const group=(state.meshResolved?.groups||[]).find(item=>item.group_id===state.meshSelectedGroupId)||(state.meshResolved?.groups||[]).find(item=>item.group_id===firstPendingId)||state.meshResolved?.groups?.[0];
     if(!group){$('meshPreviewDetails').textContent='尚未生成网片路径参数。';return;}
     state.meshSelectedGroupId=group.group_id;
     if([...$('meshPreviewGroup').options].some(option=>option.value===group.group_id))$('meshPreviewGroup').value=group.group_id;
-    const fit=group.plane_fit||{},warnings=fit.warnings||[];
-    $('meshPreviewStatus').textContent=`${group.name}：水平初始态 → 竖直下降 ${Number(group.staging_clearance_mm).toFixed(0)} mm → 绕纵轴旋转 ${Number(group.plane_angle_deg).toFixed(1)}°`;
-    $('meshPreviewDetails').innerHTML=`<strong>${escapeHtml(group.name)}</strong><span>主体段占比 ${(100*Number(fit.main_body_length_ratio||0)).toFixed(1)}%</span><span>拟合可信度 ${(100*Number(fit.confidence||0)).toFixed(1)}%</span><span>拟合残差 ${Number(fit.rms_residual_mm||0).toFixed(2)} mm</span><span>排除弯头段 ${Number(fit.excluded_segment_count||0).toLocaleString('zh-CN')} 段</span><span>旋转轴 T=${Number(group.rotation_axis?.transverse_mm||0).toFixed(1)} mm，Z=${Number(group.rotation_axis?.elevation_mm||0).toFixed(1)} mm</span>${warnings.map(value=>`<em>${escapeHtml(value)}</em>`).join('')}`;
+    const fit=group.plane_fit||{},warnings=fit.warnings||[],path=state.groupPaths.get(group.group_id)||group;
+    const minimum=path.minimum_staging_clearance_mm??group.minimum_staging_clearance_mm??group.staging_clearance_mm??state.meshDefaults.clearance;
+    const effective=path.effective_staging_clearance_mm??minimum;
+    const rotationPhase=meshPathPhases(path).find(phase=>phase.name==='installed_assembly_rotation_to_next');
+    const nextId=path.next_group_id||rotationPhase?.next_group_id||rotationPhase?.obstacle_group_ids?.[0];
+    const nextGroup=(state.meshResolved?.groups||[]).find(item=>item.group_id===nextId);
+    const rotationText=rotationPhase?.omitted||!nextId?'末片下降完成后进入整笼回正':`当前片加入累计整体，再转向“${nextGroup?.name||nextId}”`;
+    $('meshPreviewStatus').textContent=`${group.name}：当前网片保持水平竖直下降 ${Number(effective).toFixed(0)} mm → ${rotationText}`;
+    const shared=state.meshResolved?.assembly_rotation_axis||state.meshResolved?.rotation_axis||{};
+    const currentAngle=path.current_assembly_angle_deg??path.assembly_angle_current_deg??path.assembly_angle_target_deg??group.assembly_angle_deg??group.plane_angle_deg??0;
+    const nextAngle=path.next_assembly_angle_deg??path.assembly_angle_next_deg??rotationPhase?.assembly_angle_target_deg;
+    const angleText=Number.isFinite(Number(nextAngle))?`${Number(currentAngle).toFixed(1)}° → ${Number(nextAngle).toFixed(1)}°`:`${Number(currentAngle).toFixed(1)}°`;
+    $('meshPreviewDetails').innerHTML=`<strong>${escapeHtml(group.name)}</strong><span>主体段占比 ${(100*Number(fit.main_body_length_ratio||0)).toFixed(1)}%</span><span>拟合可信度 ${(100*Number(fit.confidence||0)).toFixed(1)}%</span><span>拟合残差 ${Number(fit.rms_residual_mm||0).toFixed(2)} mm</span><span>排除弯头段 ${Number(fit.excluded_segment_count||0).toLocaleString('zh-CN')} 段</span><span>下一网片 ${escapeHtml(nextGroup?.name||nextId||'无')}</span><span>装配角 ${angleText}</span><span>共用中轴 T=${Number(shared.transverse_mm||0).toFixed(1)} mm，Z=${Number(shared.elevation_mm||0).toFixed(1)} mm</span><span>最低抬高 ${Number(minimum).toFixed(0)} mm · 实际 ${Number(effective).toFixed(0)} mm</span><span>碰撞距离 ${collisionDistance(path).toFixed(2)} mm</span>${warnings.map(value=>`<em>${escapeHtml(value)}</em>`).join('')}`;
   }
 
   async function checkHealth() {
@@ -739,6 +823,8 @@
       state.barsByIndex = new Map(model.bars.map(b => [b.i, b]));
       state.assemblyPaths = new Map();
       state.groupPaths = new Map();
+      state.meshInitialPreparation = null;
+      state.meshFinalRestore = null;
       state.robotWaypoints = new Map();
       state.step = 0; state.alpha = 0; state.playing = false;
       $('playBtn').textContent = '播放';
@@ -750,8 +836,32 @@
         $('robotToggle').checked=false;$('robotToggle').disabled=true;
         try {
           const assembly=await api(`/api/tasks/${taskId}/files/mesh_group_paths.json`);
-          state.groupPaths=new Map((assembly.paths||[]).map(path=>[path.group_id,path]));
-        } catch (_) { state.groupPaths=new Map((model.group_paths||[]).map(path=>[path.group_id,path])); }
+          const paths=assembly.paths||assembly.steps||[];
+          state.groupPaths=new Map(paths.map(path=>[path.group_id,path]));
+          state.meshInitialPreparation=assembly.initial_preparation||model.initial_preparation||null;
+          state.meshFinalRestore=assembly.final_restore||model.final_restore||null;
+        } catch (_) {
+          state.groupPaths=new Map((model.group_paths||model.steps||[]).map(path=>[path.group_id,path]));
+          state.meshInitialPreparation=model.initial_preparation||null;
+          state.meshFinalRestore=model.final_restore||null;
+        }
+        const v4Motion=Number(model.schema_version)>=4||model.motion_model==='pending_group_descent_then_cumulative_rotation';
+        if(v4Motion&&state.meshInitialPreparation?.control_poses?.length){
+          const sequence=model.sequence||[];
+          if(!sequence.some(item=>item.initial_preparation||item.group_id==='__initial_preparation__')){
+            sequence.unshift({group_id:'__initial_preparation__',name:'首片准备旋转',bar_indices:model.initial_installed||[],initial_preparation:true});
+          }
+          state.groupPaths.set('__initial_preparation__',state.meshInitialPreparation);
+          $('stepSlider').max=String(sequence.length);
+        }
+        if(state.meshFinalRestore?.control_poses?.length||meshPathPhases(state.meshFinalRestore).length){
+          const sequence=model.sequence||[];
+          if(!sequence.some(item=>item.final_restore||item.group_id==='__final_restore__')){
+            sequence.push({group_id:'__final_restore__',name:'整笼回正',bar_indices:model.bars.map(bar=>bar.i),final_restore:true});
+          }
+          state.groupPaths.set('__final_restore__',state.meshFinalRestore);
+          $('stepSlider').max=String(sequence.length);
+        }
       }else{
         $('robotToggle').disabled=false;
         try {
@@ -884,6 +994,53 @@
     return {frame,phase,phaseClass,translationTotal,rotationTotal,translationDone,rotationDone,segmentTranslation,segmentRotation};
   }
 
+  function meshPathPhases(path) {
+    if(!path)return [];
+    let candidates=[];
+    if(Array.isArray(path.phase_paths))candidates=path.phase_paths;
+    else if(Array.isArray(path.stages))candidates=path.stages;
+    else if(Array.isArray(path.phases)&&path.phases.some(phase=>phase?.control_poses?.length||phase?.path?.control_poses?.length))candidates=path.phases;
+    else candidates=[path.initial_preparation_rotation,path.pending_group_descent,path.installed_assembly_rotation_to_next,path.installed_assembly_rotation,path.final_restore_rotation].filter(Boolean);
+    return candidates.map((phase,index)=>{
+      const nested=phase.path||{};
+      const name=phase.name||phase.phase||phase.phase_name||nested.name||'mesh_motion';
+      const labels={initial_preparation_rotation:'首片准备旋转',pending_group_descent:'当前待装网片水平竖直下降',installed_assembly_rotation_to_next:'累计已安装整体转向下一片',installed_assembly_rotation:'累计已安装网片整体旋转',final_restore_rotation:'全部钢筋笼回正'};
+      return {...nested,...phase,name,label:phase.label||nested.label||labels[name]||'网片运动',control_poses:phase.control_poses||nested.control_poses||[],pivot_local_mm:phase.pivot_local_mm||nested.pivot_local_mm||path.pivot_local_mm,moving_group_ids:phase.moving_group_ids||nested.moving_group_ids||[],obstacle_group_ids:phase.obstacle_group_ids||nested.obstacle_group_ids||[]};
+    });
+  }
+
+  function meshStepMotion(path,alpha) {
+    const phases=meshPathPhases(path).filter(phase=>!phase.omitted&&phase.control_poses?.length);
+    if(!phases.length){
+      const motion=pathMotionInfo(path,alpha);
+      if(motion&&path?.label){
+        motion.phase=path.label;
+        motion.phaseClass=path.name==='pending_group_descent'?'translation':'rotation';
+        if(path.collision_checked===false)motion.phase+=' · 仅动画';
+        else if(path.status==='collision_detected'){motion.phase+=' · 已记录碰撞';motion.phaseClass='collision';}
+      }
+      return motion?{phase:path,motion,localAlpha:alpha,phaseIndex:0,phases:[]}:null;
+    }
+    const weights=phases.map(phase=>Math.max(1,(phase.control_poses?.length||1)-1));
+    const total=weights.reduce((sum,value)=>sum+value,0),target=Math.min(.999999,Math.max(0,alpha))*total;
+    let consumed=0,index=0;
+    for(;index<phases.length-1&&target>=consumed+weights[index];index++)consumed+=weights[index];
+    const phase=phases[index],localAlpha=alpha>=1?1:(target-consumed)/weights[index];
+    const phaseForMotion={...phase,status:path.status,collisions:(path.collisions||[]).filter(collision=>!collision.phase||collision.phase===phase.name)};
+    const motion=pathMotionInfo(phaseForMotion,localAlpha);
+    if(motion){
+      motion.phase=phase.label;
+      motion.phaseClass=phase.name==='pending_group_descent'?'translation':'rotation';
+      if(phase.collision_checked===false)motion.phase+=' · 仅动画';
+      else if((phaseForMotion.collisions||[]).length){motion.phase+=' · 已记录碰撞';motion.phaseClass='collision';}
+    }
+    return {phase,phaseForMotion,motion,localAlpha,phaseIndex:index,phases};
+  }
+
+  function pathAtPose(path,pose) {
+    return pose?{...path,control_poses:[pose]}:null;
+  }
+
   function transformPointByPose(point,pivot,position,quaternion) {
     const rotated=rotateByQuaternion(point.map((value,k)=>value-pivot[k]),quaternion);
     return rotated.map((value,k)=>value+position[k]);
@@ -956,10 +1113,11 @@
   }
 
   function updateMotionHud(path,motion) {
-    const visible=Boolean(path&&motion&&state.step<(state.model?.sequence.length||0));
+    const visible=Boolean(path&&motion&&state.step<(state.model?.sequence?.length||0));
     $('motionHud').classList.toggle('hidden',!visible);
     $('motionLegend').classList.toggle('hidden',!visible||!$('motionGuideToggle').checked);
-    if(!visible)return;
+    const meshDetails=$('motionMeshDetails');
+    if(!visible){meshDetails?.classList.add('hidden');return;}
     const percent=Math.round(Math.min(1,Math.max(0,state.alpha))*100);
     $('motionPhase').textContent=motion.phase;
     $('motionPhase').className=`motion-phase ${motion.phaseClass}`;
@@ -968,6 +1126,24 @@
     $('motionSegment').textContent=motion.frame.segmentCount?`${motion.frame.index+1} / ${motion.frame.segmentCount}`:'就位点';
     $('motionTranslation').textContent=`${Math.round(motion.translationDone)} / ${Math.round(motion.translationTotal)} mm`;
     $('motionRotation').textContent=`${motion.rotationDone.toFixed(1)} / ${motion.rotationTotal.toFixed(1)}°`;
+    const isMeshMotion=Boolean(path.current_group_id||path.next_group_id||path.moving_group_ids||path.obstacle_group_ids||path.name?.includes('assembly_rotation')||path.name==='pending_group_descent');
+    meshDetails?.classList.toggle('hidden',!isMeshMotion);
+    if(isMeshMotion&&meshDetails){
+      const currentId=path.current_group_id||path.pending_group_id||path.group_id;
+      const nextId=path.next_group_id||path.target_group_id||null;
+      const moving=(path.moving_group_ids||[]).map(meshGroupDisplayName);
+      const obstacles=(path.obstacle_group_ids||[]).map(meshGroupDisplayName);
+      const currentAngle=path.current_assembly_angle_deg??path.assembly_angle_current_deg??path.assembly_angle_start_deg??path.assembly_angle_target_deg;
+      const nextAngle=path.next_assembly_angle_deg??path.assembly_angle_next_deg??path.assembly_angle_target_deg;
+      const angleText=Number.isFinite(Number(currentAngle))
+        ?`${Number(currentAngle).toFixed(1)}°${Number.isFinite(Number(nextAngle))&&Math.abs(Number(nextAngle)-Number(currentAngle))>1e-8?` → ${Number(nextAngle).toFixed(1)}°`:''}`
+        :'—';
+      const rotatingToNext=path.name==='installed_assembly_rotation_to_next'||path.phase==='installed_assembly_rotation_to_next'||path.phase_name==='installed_assembly_rotation_to_next';
+      const lift=rotatingToNext
+        ?(path.next_effective_staging_clearance_mm??path.effective_next_staging_clearance_mm??path.effective_staging_clearance_mm)
+        :(path.effective_staging_clearance_mm??path.next_effective_staging_clearance_mm??path.effective_next_staging_clearance_mm);
+      meshDetails.innerHTML=`<span>当前网片<b>${escapeHtml(meshGroupDisplayName(currentId))}</b></span><span>下一网片<b>${escapeHtml(meshGroupDisplayName(nextId))}</b></span><span>运动组<b title="${escapeHtml(moving.join('、'))}">${escapeHtml(moving.join('、')||'无')}</b></span><span>障碍组<b title="${escapeHtml(obstacles.join('、'))}">${escapeHtml(obstacles.join('、')||'无')}</b></span><span>装配角<b>${angleText}</b></span><span>实际抬高<b>${Number.isFinite(Number(lift))?`${Number(lift).toFixed(0)} mm`:'—'}</b></span><span class="collision-distance">碰撞距离<b>${collisionDistance(path).toFixed(2)} mm</b></span>`;
+    }
   }
 
   function drawVisualEditorModel() {
@@ -1014,24 +1190,53 @@
       const bar=state.barsByIndex.get(index);if(bar)drawPolyline(bar.p,'#ffd166',3.1,1);
     }
     if(state.meshStage==='preview'&&state.meshResolved){
-      const solved=(state.meshResolved.groups||[]).find(group=>group.group_id===state.meshSelectedGroupId)||state.meshResolved.groups?.[0];
+      const previewingPreparation=state.meshSelectedGroupId==='__initial_preparation__'&&state.meshInitialPreparation?.control_poses?.length;
+      const previewingRestore=state.meshSelectedGroupId==='__final_restore__'&&state.meshFinalRestore?.control_poses?.length;
+      const solved=previewingPreparation
+        ?{group_id:'__initial_preparation__',name:'首片准备旋转',bar_indices:[],initial_preparation:true}
+        :(previewingRestore
+        ?{group_id:'__final_restore__',name:'整笼回正',bar_indices:[],final_restore:true}
+        :((state.meshResolved.groups||[]).find(group=>group.group_id===state.meshSelectedGroupId)||state.meshResolved.groups?.[0]));
       if(solved){
-        const path=solved,alpha=state.meshPreviewAlpha;
-        for(const index of solved.bar_indices||[]){
-          const bar=state.barsByIndex.get(index);if(!bar)continue;
-          drawPolyline(bar.p,'#60d394',1,.28,null,[7,5]);
-          const points=assemblyPoints(bar,path,alpha);
-          drawPolyline(points,'#ff9d45',2.7,1);
-          const ranges=solved.plane_fit?.main_body_segments?.[String(index)]||[];
-          for(const [start,end] of ranges)drawPolyline(points.slice(start,end+1),'#69e6ff',3.5,1);
+        const path=previewingPreparation?state.meshInitialPreparation:(previewingRestore?state.meshFinalRestore:(state.groupPaths.get(solved.group_id)||solved)),alpha=state.meshPreviewAlpha;
+        if(meshPathPhases(path).length||previewingPreparation||previewingRestore){
+          const savedAlpha=state.alpha;state.alpha=alpha;
+          const v4Motion=Number(state.meshResolved.schema_version)>=4||state.meshResolved.motion_model==='pending_group_descent_then_cumulative_rotation';
+          if(v4Motion)drawV4MeshGroupTask(solved,path);else drawCumulativeMeshGroupTask(solved,path);
+          state.alpha=savedAlpha;
+          if(!previewingPreparation&&!previewingRestore){
+            const previewMotion=meshStepMotion(path,alpha);
+            const descent=meshPathPhases(path).find(phase=>phase.name==='pending_group_descent');
+            if(previewMotion&&descent){
+              const pendingPath=previewMotion.phase.name==='installed_assembly_rotation'
+                ?pathAtPose(descent,previewMotion.phase.stationary_pending_pose||descent.start_pose||descent.control_poses?.[0])
+                :(previewMotion.phase.name==='installed_assembly_rotation_to_next'?previewMotion.phase:descent);
+              const pendingAlpha=previewMotion.localAlpha;
+              for(const index of solved.bar_indices||[]){
+                const bar=state.barsByIndex.get(index);if(!bar)continue;
+                const points=assemblyPoints(bar,pendingPath,pendingAlpha);
+                const ranges=solved.plane_fit?.main_body_segments?.[String(index)]||[];
+                for(const [start,end] of ranges)drawPolyline(points.slice(start,end+1),'#69e6ff',3.5,1);
+              }
+            }
+          }
+        }else{
+          for(const index of solved.bar_indices||[]){
+            const bar=state.barsByIndex.get(index);if(!bar)continue;
+            drawPolyline(bar.p,'#60d394',1,.28,null,[7,5]);
+            const points=assemblyPoints(bar,path,alpha);
+            drawPolyline(points,'#ff9d45',2.7,1);
+            const ranges=solved.plane_fit?.main_body_segments?.[String(index)]||[];
+            for(const [start,end] of ranges)drawPolyline(points.slice(start,end+1),'#69e6ff',3.5,1);
+          }
+          const motion=pathMotionInfo(path,alpha);drawPoseAxes(motion?.frame,motion);drawRotationAxis(solved.rotation_axis);
         }
-        const motion=pathMotionInfo(path,alpha);drawPoseAxes(motion?.frame,motion);drawRotationAxis(solved.rotation_axis);
       }
     }
     for(const index of state.meshDraftSelection){const bar=state.barsByIndex.get(index);if(bar)drawPolyline(bar.p,'#d8ff3e',3.2,1);}
     const assignedCount=new Set(state.meshGroups.flatMap(group=>group.bar_indices)).size;
     $('viewerInfo').textContent=state.meshStage==='preview'
-      ?`网片路径预览 · ${state.meshSelectedGroupId||'未选择'} · ${Math.round(state.meshPreviewAlpha*100)}%`
+      ?`网片路径预览 · ${state.meshSelectedGroupId==='__initial_preparation__'?'首片准备':(state.meshSelectedGroupId==='__final_restore__'?'整笼回正':state.meshSelectedGroupId||'未选择')} · ${Math.round(state.meshPreviewAlpha*100)}%`
       :`网片分组：${assignedCount} / ${state.model.bars.length} 根 · ${state.meshGroups.length} 组 · ${state.visualBoxMode?'拖动框选':'单击选择'}`;
   }
 
@@ -1190,7 +1395,161 @@
     drawAxes();
   }
 
+  function meshGroupDefinitions() {
+    const result=new Map();
+    for(const group of state.meshGroups||[])result.set(group.group_id,group);
+    for(const group of state.meshResolved?.groups||[])result.set(group.group_id,{...(result.get(group.group_id)||{}),...group});
+    for(const group of state.model?.groups||[])result.set(group.group_id,group);
+    for(const group of state.model?.sequence||[])if(group.group_id&&!group.final_restore)result.set(group.group_id,{...(result.get(group.group_id)||{}),...group});
+    for(const [groupId,path] of state.groupPaths)if(groupId!=='__initial_preparation__'&&groupId!=='__final_restore__')result.set(groupId,{...(result.get(groupId)||{}),...path});
+    return result;
+  }
+
+  function meshGroupDisplayName(groupId) {
+    if(groupId===undefined||groupId===null||groupId==='')return '—';
+    if(groupId==='__initial_preparation__')return '首片准备旋转';
+    if(groupId==='__final_restore__')return '整笼回正';
+    const group=meshGroupDefinitions().get(String(groupId));
+    return group?.name||String(groupId);
+  }
+
+  function meshStationaryPose(phase,...fallbacks) {
+    return phase?.stationary_next_group_pose||phase?.next_group_high_pose||
+      phase?.stationary_pending_pose||phase?.pending_group_high_pose||
+      phase?.obstacle_pose||fallbacks.find(Boolean)||null;
+  }
+
+  function meshPendingStartPose(groupId) {
+    const pendingPath=state.groupPaths.get(String(groupId));
+    const descent=meshPathPhases(pendingPath).find(item=>item.name==='pending_group_descent');
+    return descent?.start_pose||descent?.control_poses?.[0]||pendingPath?.start_pose||pendingPath?.control_poses?.[0]||null;
+  }
+
+  function meshPhaseCollisionData(path,phase) {
+    const collisions=phase?.collisions?.length
+      ?phase.collisions
+      :(path?.collisions||[]).filter(item=>!item.phase||item.phase===phase?.name);
+    const worst=phase?.worst_collision||phase?.first_collision||
+      collisions.slice().sort((a,b)=>collisionDistance(b)-collisionDistance(a))[0]||
+      path?.worst_collision||path?.first_collision;
+    return {collisions,worst,detected:collisions.length>0||phase?.status==='collision_detected'};
+  }
+
+  function drawMeshGroupPose(group,path,alpha,color,width=1.9,opacity=.9) {
+    if(!group)return;
+    for(const index of group.bar_indices||[]){
+      const bar=state.barsByIndex.get(index);if(!bar)continue;
+      const points=path?.control_poses?.length?assemblyPoints(bar,path,alpha):bar.p;
+      drawPolyline(points,color,width,opacity);
+    }
+  }
+
+  function drawCumulativeMeshGroupTask(current,path) {
+    const definitions=meshGroupDefinitions(),stepMotion=meshStepMotion(path,state.alpha);
+    if(!stepMotion){updateMotionHud(null,null);return;}
+    const {phase,motion,localAlpha,phases}=stepMotion;
+    const finalRestore=Boolean(current.final_restore||current.group_id==='__final_restore__'||phase.name==='final_restore_rotation');
+    const installedIds=finalRestore
+      ?[...(phase.moving_group_ids||definitions.keys())]
+      :(path.installed_group_ids_before||[]);
+    if(finalRestore){
+      for(const groupId of installedIds)drawMeshGroupPose(definitions.get(groupId),phase,localAlpha,'#c187ff',1.7,.9);
+    }else{
+      const rotation=phases.find(item=>item.name==='installed_assembly_rotation');
+      const descent=phases.find(item=>item.name==='pending_group_descent')||phase;
+      let installedPath=null,installedAlpha=1,pendingPath=null,pendingAlpha=0;
+      if(phase.name==='installed_assembly_rotation'){
+        installedPath=phase;installedAlpha=localAlpha;
+        pendingPath=pathAtPose(descent,phase.stationary_pending_pose||descent.start_pose||descent.control_poses?.[0]);
+      }else{
+        installedPath=pathAtPose(descent,descent.end_pose||descent.control_poses?.at(-1));
+        pendingPath=descent;pendingAlpha=localAlpha;
+      }
+      for(const groupId of installedIds)drawMeshGroupPose(definitions.get(groupId),installedPath,installedAlpha,'#54a7ff',1.2,.84);
+      const pending=definitions.get(current.group_id)||current;
+      if($('motionGuideToggle').checked){
+        for(const index of pending.bar_indices||[]){
+          const bar=state.barsByIndex.get(index);if(bar)drawPolyline(bar.p,'#60d394',1,.28,null,[7,5]);
+        }
+      }
+      drawMeshGroupPose(pending,pendingPath,pendingAlpha,path.status==='collision_detected'?'#ff6767':'#ff9d45',2.4,1);
+    }
+    const sharedAxis=path.assembly_rotation_axis||state.model.assembly_rotation_axis;
+    if($('motionGuideToggle').checked)drawRotationAxis(sharedAxis);
+    const worstCollision=path.worst_collision||path.first_collision;
+    if(worstCollision?.collision_position_mm)drawWorldMarker(worstCollision.collision_position_mm,'#ff6767',6,`碰撞距离 ${collisionDistance(worstCollision).toFixed(2)} mm`);
+    drawPoseAxes(motion?.frame,motion);
+    updateMotionHud({...phase,status:path.status,collisions:path.collisions||[]},motion);
+  }
+
+  function drawV4MeshGroupTask(current,path) {
+    const definitions=meshGroupDefinitions(),stepMotion=meshStepMotion(path,state.alpha);
+    if(!stepMotion){updateMotionHud(null,null);return;}
+    const {phase,motion,localAlpha}=stepMotion;
+    const phaseName=phase.name||path.name||'';
+    const initialPreparation=Boolean(current.initial_preparation||current.assembly_stage==='initial_preparation'||current.group_id==='__initial_preparation__'||phaseName==='initial_preparation_rotation');
+    const finalRestore=Boolean(current.final_restore||current.assembly_stage==='final_restore'||current.group_id==='__final_restore__'||phaseName==='final_restore_rotation');
+    const phaseCollision=meshPhaseCollisionData(path,phase);
+
+    if(initialPreparation){
+      const moving=phase.moving_group_ids||path.moving_group_ids||[];
+      for(const groupId of moving)drawMeshGroupPose(definitions.get(String(groupId)),phase,localAlpha,phaseCollision.detected?'#d97878':'#c187ff',1.7,.92);
+      const obstacleIds=phase.obstacle_group_ids||path.obstacle_group_ids||[];
+      const obstaclePose=meshStationaryPose(phase,path.stationary_pending_pose,path.first_pending_high_pose,path.pending_group_high_pose,meshPendingStartPose(obstacleIds[0]));
+      for(const groupId of obstacleIds)drawMeshGroupPose(definitions.get(String(groupId)),pathAtPose(phase,obstaclePose),0,'#ff9d45',2.35,1);
+    }else if(finalRestore){
+      const moving=phase.moving_group_ids?.length?phase.moving_group_ids:(path.moving_group_ids||definitions.keys());
+      for(const groupId of moving)drawMeshGroupPose(definitions.get(String(groupId)),phase,localAlpha,'#c187ff',1.7,.92);
+    }else if(phaseName==='installed_assembly_rotation_to_next'){
+      const moving=phase.moving_group_ids?.length?phase.moving_group_ids:(path.installed_group_ids_after_descent||path.installed_group_ids_after||[]);
+      for(const groupId of moving)drawMeshGroupPose(definitions.get(String(groupId)),phase,localAlpha,phaseCollision.detected?'#d97878':'#c187ff',1.7,.92);
+      const nextId=path.next_group_id||phase.next_group_id||phase.obstacle_group_ids?.[0];
+      const obstacleIds=phase.obstacle_group_ids?.length?phase.obstacle_group_ids:(nextId?[nextId]:[]);
+      const nextPose=meshStationaryPose(phase,path.next_group_high_pose,path.next_pending_high_pose,meshPendingStartPose(nextId));
+      for(const groupId of obstacleIds)drawMeshGroupPose(definitions.get(String(groupId)),pathAtPose(phase,nextPose),0,'#ff9d45',2.35,1);
+    }else{
+      const installedBefore=path.installed_group_ids_before||phase.obstacle_group_ids||[];
+      const installedPose=phase.stationary_installed_pose||phase.obstacle_pose||phase.end_pose||phase.control_poses?.at(-1);
+      for(const groupId of installedBefore)drawMeshGroupPose(definitions.get(String(groupId)),pathAtPose(phase,installedPose),0,'#54a7ff',1.25,.86);
+      const currentGroup=definitions.get(current.group_id)||current;
+      if($('motionGuideToggle').checked){
+        const targetPose=phase.end_pose||phase.control_poses?.at(-1);
+        for(const index of currentGroup.bar_indices||[]){
+          const bar=state.barsByIndex.get(index);if(bar)drawPolyline(assemblyPoints(bar,pathAtPose(phase,targetPose),0),'#60d394',1,.3,null,[7,5]);
+        }
+      }
+      drawMeshGroupPose(currentGroup,phase,localAlpha,phaseCollision.detected?'#ff6767':'#ff9d45',2.4,1);
+    }
+
+    const sharedAxis=path.assembly_rotation_axis||phase.assembly_rotation_axis||state.model.assembly_rotation_axis||state.meshResolved?.assembly_rotation_axis;
+    if($('motionGuideToggle').checked)drawRotationAxis(sharedAxis);
+    if(phaseCollision.worst?.collision_position_mm)drawWorldMarker(phaseCollision.worst.collision_position_mm,'#ff6767',6,`碰撞距离 ${collisionDistance(phaseCollision.worst).toFixed(2)} mm`);
+    drawPoseAxes(motion?.frame,motion);
+    const currentId=initialPreparation
+      ?(path.next_group_id||path.pending_group_id||phase.obstacle_group_ids?.[0])
+      :(finalRestore?null:(path.group_id||current.group_id));
+    const nextId=initialPreparation
+      ?currentId
+      :(path.next_group_id||phase.next_group_id||phase.obstacle_group_ids?.[0]||null);
+    updateMotionHud({...path,...phase,status:phaseCollision.detected?'collision_detected':(phase.status||path.status),collisions:phaseCollision.collisions,current_group_id:currentId,next_group_id:nextId},motion);
+  }
+
   function drawMeshGroupTask() {
+    const sequence=state.model.sequence||[];
+    if(state.step<sequence.length){
+      const current=sequence[state.step],path=state.groupPaths.get(current.group_id)||current;
+      const v4Motion=Number(state.model.schema_version)>=4||state.model.motion_model==='pending_group_descent_then_cumulative_rotation'||path.motion_model==='pending_group_descent_then_cumulative_rotation';
+      if(v4Motion&&(meshPathPhases(path).length||path?.control_poses?.length||current.initial_preparation||current.final_restore)){
+        drawV4MeshGroupTask(current,path);return;
+      }
+      if(state.model.schema_version>=3&&(meshPathPhases(path).length||current.final_restore)){
+        drawCumulativeMeshGroupTask(current,path);return;
+      }
+    }
+    drawLegacyMeshGroupTask();
+  }
+
+  function drawLegacyMeshGroupTask() {
     const sequence=state.model.sequence||[],installedIds=new Set(state.model.initial_installed||[]);
     const collidedInstalledIds=new Set();
     for(let step=0;step<Math.min(state.step,sequence.length);step++){
@@ -1257,10 +1616,23 @@
     if (state.model && state.step<total) {
       if(state.model.assembly_unit==='mesh_group'){
         const item=state.model.sequence[state.step],path=state.groupPaths.get(item.group_id)||item;
+        if(item.initial_preparation||item.assembly_stage==='initial_preparation'||item.group_id==='__initial_preparation__'){
+          const status=path?.status==='collision_detected'
+            ?`记录 ${path.collision_pair_count||0} 对碰撞 · 最大碰撞距离 ${collisionDistance(path).toFixed(2)} mm，继续播放`
+            :'无碰撞';
+          $('viewerInfo').textContent=`首片准备：初始已安装整体转向首片水平装配角 · 首片高位固定 · ${status}`;
+          return;
+        }
+        if(item.final_restore||item.group_id==='__final_restore__'){
+          $('viewerInfo').textContent='最终动画：全部钢筋笼绕共用纵向中轴回正至 IFC 姿态 · 不进行碰撞检查';
+          return;
+        }
         const status=path?.status==='collision_detected'
           ?`记录 ${path.collision_pair_count||0} 对碰撞 · 最大碰撞距离 ${collisionDistance(path).toFixed(2)} mm，继续播放`
           :'无碰撞';
-        $('viewerInfo').textContent=`当前安装：第 ${state.step+1} 组 · ${item.name||item.group_id} · ${(item.bar_indices||[]).length} 根 · ${status}`;
+        const installationStep=path.installation_step??item.installation_step??state.model.sequence.slice(0,state.step+1).filter(value=>!value.initial_preparation&&!value.final_restore&&!String(value.group_id).startsWith('__')).length;
+        const nextName=meshGroupDisplayName(path.next_group_id);
+        $('viewerInfo').textContent=`当前安装：第 ${installationStep} 组 · ${item.name||item.group_id} · ${(item.bar_indices||[]).length} 根 · ${path.next_group_id?`下降后转向 ${nextName} · `:''}${status}`;
         return;
       }
       const item=state.model.sequence[state.step],path=state.assemblyPaths.get(item.i);
@@ -1269,10 +1641,14 @@
       const pathText=path?` · ${path.path_type} · ${path.status==='collision_free'?'无碰撞':'检测到碰撞'}`:'';
       $('viewerInfo').textContent=`当前安装：第 ${state.step+1} 根 · ${barLabel}${pathText}`;
     } else if (total) {
-      const collisionPaths=state.model?.assembly_unit==='mesh_group'?state.model.sequence.map(item=>state.groupPaths.get(item.group_id)||item).filter(path=>path.status==='collision_detected'):[];
+      const collisionPaths=state.model?.assembly_unit==='mesh_group'?state.model.sequence.filter(item=>!item.final_restore&&item.group_id!=='__final_restore__').map(item=>state.groupPaths.get(item.group_id)||item).filter(path=>path.status==='collision_detected'):[];
       const pairCount=collisionPaths.reduce((sum,path)=>sum+Number(path.collision_pair_count||0),0);
       const maximum=Math.max(0,...collisionPaths.map(collisionDistance));
-      $('viewerInfo').textContent=collisionPaths.length?`模拟完成 · ${collisionPaths.length} 组、${pairCount} 对碰撞 · 最大碰撞距离 ${maximum.toFixed(2)} mm`:`安装完成 · ${total.toLocaleString('zh-CN')} ${state.model?.assembly_unit==='mesh_group'?'组':'根'}`;
+      const installedTotal=state.model?.assembly_unit==='mesh_group'?state.model.sequence.filter(item=>!item.initial_preparation&&!item.final_restore&&item.group_id!=='__initial_preparation__'&&item.group_id!=='__final_restore__').length:total;
+      const preparationCollided=collisionPaths.some(path=>path===state.meshInitialPreparation||path.name==='initial_preparation_rotation');
+      const collidedGroupCount=collisionPaths.length-(preparationCollided?1:0);
+      const collisionScope=preparationCollided?`首片准备${collidedGroupCount?`及 ${collidedGroupCount} 组`:''}`:`${collidedGroupCount} 组`;
+      $('viewerInfo').textContent=collisionPaths.length?`模拟完成 · ${collisionScope}、${pairCount} 对碰撞 · 最大碰撞距离 ${maximum.toFixed(2)} mm`:`安装完成 · ${installedTotal.toLocaleString('zh-CN')} ${state.model?.assembly_unit==='mesh_group'?'组':'根'}`;
     }
     else if (initialInstalled) $('viewerInfo').textContent=`模型中的 ${initialInstalled.toLocaleString('zh-CN')} 根钢筋均标记为已安装`;
   }
@@ -1291,9 +1667,11 @@
   }
 
   async function submitTask() {
-    const file=$('fileInput').files[0];
-    if(!file){showNote('请选择 IFC 文件。',true);return;}
+    const files=selectedIfcFiles();
+    if(!files.length){showNote('请选择 IFC 文件。',true);return;}
     const sequenceSource=$('sequenceSource').value,sequenceFile=$('sequenceFile').files[0];
+    if(sequenceSource!=='visual_groups'&&files.length!==1){showNote('当前顺序模式只支持一个完整 IFC 文件。',true);return;}
+    if(sequenceSource==='visual_groups'&&usesMultipleMeshIfcFiles()&&files.length<2){showNote('多 IFC 自动分组方式请至少选择两个 IFC 文件。',true);return;}
     let sequencePayload=null;
     if(sequenceSource==='excel'&&!sequenceFile){showNote('请选择 Excel 安装顺序表。',true);return;}
     if(sequenceSource==='visual'){
@@ -1304,7 +1682,7 @@
     }
     if(sequenceSource==='visual_groups'){
       sequencePayload=state.meshGroupPayload;
-      if(sequencePayload?.mode!=='mesh_groups'||sequencePayload?.schema_version!==2||!Array.isArray(sequencePayload?.groups)||!sequencePayload.groups.length||state.visualSourceKey!==selectedFileKey()){
+      if(sequencePayload?.mode!=='mesh_groups'||sequencePayload?.schema_version!==4||sequencePayload?.motion_model!=='pending_group_descent_then_cumulative_rotation'||!Array.isArray(sequencePayload?.groups)||!sequencePayload.groups.length||state.visualSourceKey!==selectedFileKey()){
         showNote('请先完成全部钢筋的网片分组、安装顺序和路径参数并保存。',true);return;
       }
     }
@@ -1317,11 +1695,11 @@
       robot_linear_speed_mm_s:Number($('linearSpeed').value), robot_angular_speed_deg_s:45,
       robot_sample_period_s:Number($('samplePeriod').value), outside_margin_mm:800, preinsert_distance_mm:250, retreat_distance_mm:300, grasp_fraction:.5,
     };
-    const form=new FormData();form.append('file',file);
+    const form=new FormData();appendSelectedIfcFiles(form);
     if(sequenceSource==='excel')form.append('sequence_file',sequenceFile);
     if(sequencePayload)form.append('visual_sequence_json',JSON.stringify(sequencePayload));
     form.append('options_json',JSON.stringify(options));
-    $('submitBtn').disabled=true;showNote('正在上传模型…');
+    $('submitBtn').disabled=true;showNote(files.length>1?`正在上传 ${files.length} 个网片 IFC…`:'正在上传模型…');
     try{
       const result=await api('/api/tasks',{method:'POST',body:form});
       showNote(`任务已创建：${result.task_id.slice(0,8)}`);await refreshTasks();await selectTask(result.task_id);
@@ -1359,6 +1737,12 @@
     $('assemblyEnabled').disabled=e.target.value==='visual_groups';
     $('robotEnabled').disabled=e.target.value==='visual_groups';
     if(e.target.value==='visual_groups'){$('assemblyEnabled').checked=true;$('robotEnabled').checked=false;}
+    syncIfcInputMode(true);
+  });
+  $('meshInputMode').addEventListener('change',()=>{
+    resetVisualSequence();
+    $('fileInput').value='';
+    syncIfcInputMode(false);
   });
   $('sequenceFile').addEventListener('change',e=>{
     $('sequenceFileLabel').textContent=e.target.files[0]?.name||'选择安装顺序表';
@@ -1432,8 +1816,6 @@
     const group=meshGroupById(card.dataset.meshGroupId),field=event.target.dataset.meshField;if(!group||!field)return;
     if(field==='installation_status')group.installation_status=event.target.checked?'preinstalled':'pending';
     else if(field==='plane_angle_deg')group.plane_angle_deg=nullableNumber(event.target.value);
-    else if(field==='axis_transverse')group.rotation_axis.transverse_mm=nullableNumber(event.target.value);
-    else if(field==='axis_elevation')group.rotation_axis.elevation_mm=nullableNumber(event.target.value);
     else if(field==='staging_clearance_mm')group.staging_clearance_mm=nullableNumber(event.target.value);
     invalidateMeshSolution();
   });
@@ -1449,7 +1831,7 @@
     event.preventDefault();const card=event.target.closest('[data-mesh-order-index]');
     if(card&&state.meshDragIndex!==null)moveMeshGroup(state.meshDragIndex,Number(card.dataset.meshOrderIndex));state.meshDragIndex=null;
   });
-  for(const id of ['meshLongitudinalX','meshLongitudinalY','meshLongitudinalZ','meshTopElevation','meshDefaultClearance'])$(id).addEventListener('input',invalidateMeshSolution);
+  for(const id of ['meshLongitudinalX','meshLongitudinalY','meshLongitudinalZ','meshAxisTransverse','meshAxisElevation','meshDefaultClearance'])$(id).addEventListener('input',invalidateMeshSolution);
   $('meshSolveBtn').addEventListener('click',()=>solveMeshGroups(true));
   $('meshRefreshPreviewBtn').addEventListener('click',()=>solveMeshGroups(true));
   $('meshPreviewGroup').addEventListener('change',event=>{state.meshSelectedGroupId=event.target.value;renderMeshPreviewDetails();draw();});
@@ -1504,8 +1886,9 @@
   const dropzone=$('dropzone');
   for(const name of ['dragenter','dragover'])dropzone.addEventListener(name,e=>{e.preventDefault();dropzone.classList.add('drag');});
   for(const name of ['dragleave','drop'])dropzone.addEventListener(name,e=>{e.preventDefault();dropzone.classList.remove('drag');});
-  dropzone.addEventListener('drop',e=>{const files=e.dataTransfer.files;if(files.length){resetVisualSequence();$('fileInput').files=files;$('fileLabel').textContent=files[0].name;updateSequenceGeneratorState();}});
-  $('fileInput').addEventListener('change',e=>{resetVisualSequence();$('fileLabel').textContent=e.target.files[0]?.name||'拖入 IFC 文件或点击选择';updateSequenceGeneratorState();});
+  dropzone.addEventListener('drop',e=>{const files=e.dataTransfer.files;if(files.length){if(!usesMultipleMeshIfcFiles()&&files.length>1){showNote('当前输入方式只接受一个 IFC；如需多个文件，请选择“多个 IFC，每个文件自动作为一个网片组”。',true);return;}resetVisualSequence();$('fileInput').files=files;updateIfcFileLabel();updateSequenceGeneratorState();}});
+  $('fileInput').addEventListener('change',()=>{resetVisualSequence();updateIfcFileLabel();updateSequenceGeneratorState();});
+  syncIfcInputMode(false);
 
   updateSequenceGeneratorState();checkHealth();refreshTasks();requestAnimationFrame(animate);
 })();

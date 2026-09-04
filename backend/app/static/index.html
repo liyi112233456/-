@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>钢筋空间拓扑规划与碰撞检测系统</title>
-  <link rel="stylesheet" href="/static/styles.css?v=1.6.2">
+  <link rel="stylesheet" href="/static/styles.css?v=1.9.0">
 </head>
 <body>
   <header class="topbar">
@@ -49,8 +49,15 @@
           <small id="visualSequenceSummary">选择 IFC 后，可在三维模型中点击钢筋并指定安装顺序。</small>
         </div>
         <div id="meshGroupSetup" class="sequence-upload hidden">
+          <label class="select-row">网片模型输入方式
+            <select id="meshInputMode">
+              <option value="single" selected>一个完整 IFC，进入系统后手动分组</option>
+              <option value="multiple">多个 IFC，每个文件自动作为一个网片组</option>
+            </select>
+          </label>
+          <small id="meshInputModeHint">当前方式：选择一个完整 IFC，再用点选或框选划分网片。</small>
           <button id="meshGroupBtn" type="button" disabled>解析 IFC 并划分钢筋网片组</button>
-          <small id="meshGroupSummary">点选或框选钢筋组成网片组，再指定各网片组的安装顺序与旋转参数。</small>
+          <small id="meshGroupSummary">也可选择多个独立网片 IFC，系统按文件自动分组；随后指定安装顺序。首片准备 → 当前片水平下降 → 累计整体转向下一片。</small>
           <small>网片模式固定执行整组六自由度碰撞检查；因尚未定义多点夹具与 TCP，不生成机器人程序。</small>
         </div>
         <div class="sequence-generator">
@@ -122,10 +129,11 @@
               <span>平移 <b id="motionTranslation">—</b></span>
               <span>转动 <b id="motionRotation">—</b></span>
             </div>
+            <div class="motion-mesh-details hidden" id="motionMeshDetails"></div>
           </div>
           <div class="motion-legend hidden" id="motionLegend">
             <span><i class="legend-line path"></i>安装轨迹</span>
-            <span><i class="legend-line moving"></i>当前钢筋</span>
+            <span><i class="legend-line moving"></i>当前运动单元</span>
             <span><i class="legend-line target"></i>目标位置</span>
             <span><i class="legend-line collision"></i>碰撞路径</span>
           </div>
@@ -204,22 +212,23 @@
 
           <section id="meshParametersStage" class="mesh-stage hidden">
             <div class="mesh-global-parameters">
-              <div class="mesh-section-heading"><div><strong>全局坐标与摆放参数</strong><small>纵轴由模型自动识别，可人工修正；旋转轴始终与纵轴平行。</small></div><button id="meshSolveBtn" type="button" class="primary">自动求解参数</button></div>
+              <div class="mesh-section-heading"><div><strong>全局坐标与累计安装参数</strong><small>系统自动识别箱梁纵轴和共用旋转中轴；可在此人工修正，中轴方向始终与纵轴平行。</small></div><button id="meshSolveBtn" type="button" class="primary">自动求解参数</button></div>
               <div class="mesh-parameter-grid global">
                 <label>纵轴 X<input id="meshLongitudinalX" type="number" step="0.001" placeholder="自动"></label>
                 <label>纵轴 Y<input id="meshLongitudinalY" type="number" step="0.001" placeholder="自动"></label>
                 <label>纵轴 Z<input id="meshLongitudinalZ" type="number" step="0.001" placeholder="自动"></label>
-                <label>顶面标高 / mm<input id="meshTopElevation" type="number" step="1" placeholder="自动"></label>
-                <label>默认初始抬高 / mm<input id="meshDefaultClearance" type="number" min="0" step="10" value="800"></label>
+                <label>共用中轴横向 / mm<input id="meshAxisTransverse" type="number" step="1" placeholder="自动"></label>
+                <label>共用中轴标高 / mm<input id="meshAxisElevation" type="number" step="1" placeholder="自动"></label>
+                <label>默认最低抬高 / mm<input id="meshDefaultClearance" type="number" min="0" step="10" value="800"></label>
               </div>
             </div>
-            <div class="mesh-section-heading"><div><strong>网片组安装顺序与参数</strong><small>可拖动或用箭头排序；空白参数会由后台自动拟合。</small></div><b id="meshParameterGroupCount">0 组</b></div>
+            <div class="mesh-section-heading"><div><strong>网片组安装顺序与参数</strong><small>可拖动或用箭头排序；每组只需确认最终平面角和最低抬高，实际起点会自动避开累计钢筋笼扫掠范围。</small></div><b id="meshParameterGroupCount">0 组</b></div>
             <div id="meshParameterList" class="mesh-parameter-list"></div>
           </section>
 
           <section id="meshPreviewStage" class="mesh-stage hidden">
             <div class="mesh-preview-toolbar">
-              <div><strong>网片组共享六自由度路径</strong><small id="meshPreviewStatus">请先自动求解参数，再选择网片组查看水平初始态、竖直下降和定轴旋转。</small></div>
+              <div><strong>累计钢筋笼安装路径</strong><small id="meshPreviewStatus">请先自动求解参数，再查看“首片准备 → 当前片水平下降 → 累计整体转向下一片”；最后一步为整笼回正。</small></div>
               <button id="meshRefreshPreviewBtn" type="button" class="primary">重新求解并预览</button>
             </div>
             <div class="mesh-preview-controls">
@@ -270,6 +279,6 @@
   <footer>
     <span>FastAPI 后台计算服务</span><span>浏览器自包含三维线框渲染器</span><span>ABB · KUKA · UR · CSV</span>
   </footer>
-  <script src="/static/app.js?v=1.6.2"></script>
+  <script src="/static/app.js?v=1.9.0"></script>
 </body>
 </html>

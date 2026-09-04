@@ -397,6 +397,75 @@ def _normal_angle(longitudinal: np.ndarray, vertical: np.ndarray, normal: np.nda
     return angle
 
 
+def _resolve_assembly_rotation_axis(
+    payload: dict,
+    model_center: np.ndarray,
+    longitudinal: np.ndarray,
+    transverse: np.ndarray,
+    vertical: np.ndarray,
+) -> dict:
+    """Resolve the single longitudinal axis shared by the cumulative cage."""
+    value = payload.get("assembly_rotation_axis", MISSING)
+    if value is MISSING or value is None:
+        raw_axis: dict = {}
+    elif not isinstance(value, dict):
+        raise ValueError("累计钢筋笼旋转中轴必须是对象")
+    else:
+        raw_axis = value
+    direction_value = raw_axis.get("direction")
+    if direction_value not in (None, [], ""):
+        supplied_direction = _unit(direction_value)
+        if abs(float(np.dot(supplied_direction, longitudinal))) < 0.999:
+            raise ValueError("累计钢筋笼旋转中轴必须平行箱梁纵向")
+    point_value = raw_axis.get("point_mm", MISSING)
+    manually_positioned = False
+    if point_value is not MISSING and point_value is not None and point_value != "":
+        if not isinstance(point_value, (list, tuple)) or len(point_value) != 3:
+            raise ValueError("累计钢筋笼旋转中轴点必须包含 3 个有限数值")
+        try:
+            point = np.asarray(point_value, dtype=float)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("累计钢筋笼旋转中轴点无效") from exc
+        if not np.all(np.isfinite(point)):
+            raise ValueError("累计钢筋笼旋转中轴点无效")
+        manually_positioned = True
+    else:
+        transverse_value = _optional_finite(
+            raw_axis, "transverse_mm", "累计钢筋笼旋转中轴横向坐标"
+        )
+        elevation_value = _optional_finite(
+            raw_axis, "elevation_mm", "累计钢筋笼旋转中轴标高"
+        )
+        point = np.asarray(model_center, dtype=float).copy()
+        if transverse_value is not None:
+            point += transverse * (transverse_value - float(np.dot(point, transverse)))
+        if elevation_value is not None:
+            point += vertical * (elevation_value - float(np.dot(point, vertical)))
+        manually_positioned = transverse_value is not None or elevation_value is not None
+    return {
+        "point_mm": _round_vector(point, 5),
+        "direction": _round_vector(longitudinal),
+        "transverse_mm": float(np.dot(point, transverse)),
+        "elevation_mm": float(np.dot(point, vertical)),
+        "source": "manual" if manually_positioned else "automatic_main_body_center",
+    }
+
+
+def _assembly_pose(
+    axis_point: np.ndarray,
+    longitudinal: np.ndarray,
+    angle_rad: float,
+    vertical: np.ndarray | None = None,
+    lift_mm: float = 0.0,
+    label: str = "",
+) -> dict:
+    position = np.asarray(axis_point, dtype=float).copy()
+    if vertical is not None and abs(float(lift_mm)) > EPS:
+        position += np.asarray(vertical, dtype=float) * float(lift_mm)
+    quaternion = Rotation.from_rotvec(longitudinal * float(angle_rad)).as_quat()
+    return _serialize_pose(position, quaternion, label)
+
+
 def resolve_mesh_groups(
     rebars: list[Rebar],
     payload: dict,
@@ -411,8 +480,29 @@ def resolve_mesh_groups(
         raise ValueError("IFC 模型中没有可用钢筋")
     if not isinstance(payload, dict) or payload.get("mode") != "mesh_groups":
         raise ValueError("网片组 JSON 的 mode 必须是 mesh_groups")
-    if int(payload.get("schema_version", 0)) != 2:
-        raise ValueError("网片组 JSON 的 schema_version 必须是 2")
+    source_schema_version = _strict_integer(
+        payload.get("schema_version", 0), "网片组 JSON 的 schema_version"
+    )
+    if source_schema_version not in {2, 3, 4}:
+        raise ValueError("网片组 JSON 的 schema_version 必须是 2、3 或 4")
+    if (
+        source_schema_version == 3
+        and payload.get("motion_model")
+        != "cumulative_installed_rotation_then_pending_descent"
+    ):
+        raise ValueError(
+            "版本 3 网片组的 motion_model 必须是 "
+            "cumulative_installed_rotation_then_pending_descent"
+        )
+    if (
+        source_schema_version == 4
+        and payload.get("motion_model")
+        != "pending_group_descent_then_cumulative_rotation"
+    ):
+        raise ValueError(
+            "版本 4 网片组的 motion_model 必须是 "
+            "pending_group_descent_then_cumulative_rotation"
+        )
     fingerprint = model_fingerprint or rebar_model_fingerprint(rebars)
     supplied_fingerprint = str(payload.get("model_fingerprint") or "").strip()
     if not supplied_fingerprint:
@@ -482,6 +572,7 @@ def resolve_mesh_groups(
                 "installation_status": "preinstalled" if preinstalled else "pending",
                 "preinstalled": preinstalled,
                 "bar_indices": indices,
+                "source_filename": str(raw.get("source_filename") or "").strip(),
             }
         )
     missing = sorted(expected - set(seen))
@@ -537,71 +628,59 @@ def resolve_mesh_groups(
     default_clearance = _optional_finite(payload, "staging_clearance_mm", "默认初始抬高距离")
     if default_clearance is None:
         default_clearance = _optional_finite(
+            payload, "minimum_staging_clearance_mm", "默认最低抬高距离"
+        )
+    if default_clearance is None:
+        default_clearance = _optional_finite(
             payload, "default_staging_clearance_mm", "默认初始抬高距离"
         )
     default_clearance = 800.0 if default_clearance is None else default_clearance
     if default_clearance < 0.0:
         raise ValueError("网片初始抬高距离不能为负数")
 
+    main_body_points: list[np.ndarray] = []
+    for group, fit_info in zip(validated, fits):
+        masks = fit_info["fit"].get("main_body_segments", {})
+        for index in group["bar_indices"]:
+            bar = by_index[index]
+            for start, end in masks.get(str(index), []):
+                main_body_points.append(bar.axis[int(start):int(end) + 1])
+    assembly_center = (
+        np.median(np.concatenate(main_body_points, axis=0), axis=0)
+        if main_body_points
+        else model_center
+    )
+    assembly_axis = _resolve_assembly_rotation_axis(
+        payload, assembly_center, longitudinal, transverse, vertical
+    )
+    assembly_axis_point = np.asarray(assembly_axis["point_mm"], dtype=float)
+
     resolved_groups: list[dict] = []
     for group, fit_info in zip(validated, fits):
         raw = group.pop("raw")
         fit = fit_info["fit"]
         angle = float(fit_info["angle"])
-        centroid = fit_info["centroid"]
-        auto_axis = _rotation_axis_point(
-            centroid, angle, top_elevation, longitudinal, transverse, vertical
-        )
-        axis_value = raw.get("rotation_axis", MISSING)
-        if axis_value is MISSING or axis_value is None:
-            raw_axis = {}
-        elif not isinstance(axis_value, dict):
-            raise ValueError(f"网片组 {group['group_id']} 的旋转轴必须是对象")
-        else:
-            raw_axis = axis_value
-        direction_value = raw_axis.get("direction")
-        if direction_value not in (None, [], ""):
-            supplied_direction = _unit(direction_value)
-            if abs(float(np.dot(supplied_direction, longitudinal))) < 0.999:
-                raise ValueError(f"网片组 {group['group_id']} 的旋转轴必须平行箱梁纵向")
-        point_value = raw_axis.get("point_mm", MISSING)
-        axis_manually_positioned = False
-        if point_value is not MISSING and point_value is not None and point_value != "":
-            if not isinstance(point_value, (list, tuple)) or len(point_value) != 3:
-                raise ValueError(f"网片组 {group['group_id']} 的旋转轴点必须包含 3 个有限数值")
-            try:
-                point = np.asarray(point_value, dtype=float)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"网片组 {group['group_id']} 的旋转轴点无效") from exc
-            if not np.all(np.isfinite(point)):
-                raise ValueError(f"网片组 {group['group_id']} 的旋转轴点无效")
-            axis_manually_positioned = True
-        else:
-            transverse_value = _optional_finite(
-                raw_axis, "transverse_mm", f"网片组 {group['group_id']} 的旋转轴横向坐标"
-            )
-            elevation_value = _optional_finite(
-                raw_axis, "elevation_mm", f"网片组 {group['group_id']} 的旋转轴标高"
-            )
-            point = auto_axis.copy()
-            if transverse_value is not None:
-                point += transverse * (transverse_value - float(np.dot(point, transverse)))
-            if elevation_value is not None:
-                point += vertical * (elevation_value - float(np.dot(point, vertical)))
-            axis_manually_positioned = transverse_value is not None or elevation_value is not None
         clearance = _optional_finite(
             raw, "staging_clearance_mm", f"网片组 {group['group_id']} 的初始抬高距离"
         )
+        if clearance is None:
+            clearance = _optional_finite(
+                raw, "minimum_staging_clearance_mm",
+                f"网片组 {group['group_id']} 的最低抬高距离",
+            )
         clearance = default_clearance if clearance is None else clearance
         if clearance < 0.0:
             raise ValueError(f"网片组 {group['group_id']} 的抬高距离不能为负数")
-        transition_rotation = Rotation.from_rotvec(-longitudinal * angle)
-        transition_quaternion = transition_rotation.as_quat()
-        identity = np.array([0.0, 0.0, 0.0, 1.0])
+        assembly_angle = -angle
         control_poses = [
-            _serialize_pose(point + vertical * clearance, transition_quaternion, "水平初始态"),
-            _serialize_pose(point, transition_quaternion, "顶面过渡态"),
-            _serialize_pose(point, identity, "IFC 最终安装态"),
+            _assembly_pose(
+                assembly_axis_point, longitudinal, assembly_angle,
+                vertical, clearance, "最低抬高水平初始态",
+            ),
+            _assembly_pose(
+                assembly_axis_point, longitudinal, assembly_angle,
+                label="当前装配角下的安装态",
+            ),
         ]
         bars = [by_index[index] for index in group["bar_indices"]]
         resolved_groups.append(
@@ -609,19 +688,18 @@ def resolve_mesh_groups(
                 **group,
                 "bim_ids": [rebar_display_id(bar) for bar in bars],
                 "plane_angle_deg": float(math.degrees(angle)),
+                "assembly_angle_deg": float(math.degrees(assembly_angle)),
                 "plane_fit": fit,
-                "rotation_axis": {
-                    "point_mm": _round_vector(point, 5),
-                    "direction": _round_vector(longitudinal),
-                    "transverse_mm": float(np.dot(point, transverse)),
-                    "elevation_mm": float(np.dot(point, vertical)),
-                    "source": "manual" if axis_manually_positioned else "automatic",
-                },
-                "pivot_local_mm": _round_vector(point, 5),
+                "rotation_axis": dict(assembly_axis),
+                "pivot_local_mm": list(assembly_axis["point_mm"]),
                 "staging_clearance_mm": float(clearance),
+                "minimum_staging_clearance_mm": float(clearance),
                 "phases": [
-                    {"name": "vertical_descent", "label": "竖直下降", "from_pose": 0, "to_pose": 1},
-                    {"name": "fixed_axis_rotation", "label": "绕纵轴旋转", "from_pose": 1, "to_pose": 2},
+                    {"name": "pending_group_descent", "label": "待安装网片竖直下降"},
+                    {
+                        "name": "installed_assembly_rotation_to_next",
+                        "label": "累计已安装网片整体转向下一网片",
+                    },
                 ],
                 "control_poses": control_poses,
             }
@@ -629,7 +707,13 @@ def resolve_mesh_groups(
 
     return {
         "mode": "mesh_groups",
-        "schema_version": 2,
+        "schema_version": 4,
+        "source_schema_version": source_schema_version,
+        "migrated_from_schema_version": (
+            source_schema_version if source_schema_version < 4 else None
+        ),
+        "motion_model": "pending_group_descent_then_cumulative_rotation",
+        "input_mode": str(payload.get("input_mode") or "single_complete_ifc"),
         "units": "mm",
         "model_fingerprint": fingerprint,
         "longitudinal_axis": _round_vector(longitudinal),
@@ -640,8 +724,10 @@ def resolve_mesh_groups(
             "transverse": _round_vector(transverse),
             "vertical": _round_vector(vertical),
         },
+        "assembly_rotation_axis": assembly_axis,
         "top_elevation_mm": float(top_elevation),
         "top_elevation_source": top_source,
+        "top_elevation_controls_motion": False,
         "staging_clearance_mm": float(default_clearance),
         "group_count": len(resolved_groups),
         "groups": resolved_groups,
@@ -895,12 +981,1319 @@ class _GroupCollisionWorld:
         return not hits, hits, minimum_clearance
 
 
+class _FixedObstacleCollisionWorld:
+    """Collision index for a v3 phase with fixed obstacle geometry."""
+
+    def __init__(self, obstacles: list[dict], clearance_mm: float) -> None:
+        self.clearance_mm = float(clearance_mm)
+        self.owner: list[int] = []
+        self.owner_segment: list[int] = []
+        self.owner_group: list[str] = []
+        self.a: list[np.ndarray] = []
+        self.b: list[np.ndarray] = []
+        self.radius: list[float] = []
+        self.display_by_bar: dict[int, str] = {}
+        geoms = []
+        for entry in obstacles:
+            bar: Rebar = entry["bar"]
+            axis = np.asarray(entry["axis"], dtype=float)
+            group_id = str(entry["group_id"])
+            self.display_by_bar[int(bar.index)] = rebar_display_id(bar)
+            for segment_index, (start, end) in enumerate(zip(axis[:-1], axis[1:])):
+                self.owner.append(int(bar.index))
+                self.owner_segment.append(int(segment_index))
+                self.owner_group.append(group_id)
+                self.a.append(np.asarray(start, dtype=float))
+                self.b.append(np.asarray(end, dtype=float))
+                self.radius.append(float(bar.radius))
+                geoms.append(
+                    Point(float(start[0]), float(start[1]))
+                    if float(np.linalg.norm(end[:2] - start[:2])) <= EPS
+                    else LineString([start[:2], end[:2]])
+                )
+        self.owner_array = np.asarray(self.owner, dtype=np.int32)
+        self.owner_segment_array = np.asarray(self.owner_segment, dtype=np.int32)
+        self.a_array = np.asarray(self.a, dtype=float).reshape((-1, 3))
+        self.b_array = np.asarray(self.b, dtype=float).reshape((-1, 3))
+        self.radius_array = np.asarray(self.radius, dtype=float)
+        self.max_radius = float(max(self.radius, default=0.0))
+        self.tree = STRtree(geoms) if geoms else None
+        self.pose_checks = 0
+        self.segment_tests = 0
+
+    def candidates(self, start: np.ndarray, end: np.ndarray, radius: float) -> np.ndarray:
+        if self.tree is None:
+            return np.empty(0, dtype=np.int64)
+        pad = radius + self.max_radius + max(0.0, self.clearance_mm)
+        low = np.minimum(start[:2], end[:2]) - pad
+        high = np.maximum(start[:2], end[:2]) + pad
+        indices = np.asarray(
+            self.tree.query(box(float(low[0]), float(low[1]), float(high[0]), float(high[1]))),
+            dtype=np.int64,
+        )
+        if not len(indices):
+            return indices
+        threshold = radius + self.radius_array[indices] + self.clearance_mm
+        obstacle_low = np.minimum(self.a_array[indices, 2], self.b_array[indices, 2])
+        obstacle_high = np.maximum(self.a_array[indices, 2], self.b_array[indices, 2])
+        moving_low = min(float(start[2]), float(end[2]))
+        moving_high = max(float(start[2]), float(end[2]))
+        return indices[
+            (obstacle_high + threshold >= moving_low)
+            & (obstacle_low - threshold <= moving_high)
+        ]
+
+    def final_contacts(self, moving: list[dict]) -> dict[tuple[int, int, int], float]:
+        contacts: dict[tuple[int, int, int], float] = {}
+        for entry in moving:
+            bar: Rebar = entry["bar"]
+            for segment_index, (start, end) in enumerate(
+                zip(entry["axis"][:-1], entry["axis"][1:])
+            ):
+                indices = self.candidates(start, end, float(bar.radius))
+                if not len(indices):
+                    continue
+                count = len(indices)
+                distances = _segment_distances_batch(
+                    np.repeat(start[None, :], count, axis=0),
+                    np.repeat(end[None, :], count, axis=0),
+                    self.a_array[indices],
+                    self.b_array[indices],
+                )
+                thresholds = float(bar.radius) + self.radius_array[indices] + self.clearance_mm
+                for candidate, distance, threshold in zip(indices, distances, thresholds):
+                    if float(distance) < float(threshold) - 1.0e-7:
+                        contacts[(int(bar.index), int(segment_index), int(candidate))] = float(distance)
+        return contacts
+
+    def check(
+        self,
+        moving: list[dict],
+        final_contacts: dict[tuple[int, int, int], float] | None = None,
+        allow_final_contacts: bool = False,
+    ) -> tuple[bool, list[dict], float]:
+        self.pose_checks += 1
+        final_contacts = final_contacts or {}
+        minimum_clearance = math.inf
+        hits_by_pair: dict[tuple[int, int], dict] = {}
+        for entry in moving:
+            bar: Rebar = entry["bar"]
+            moving_id = int(bar.index)
+            moving_group_id = str(entry["group_id"])
+            self.display_by_bar.setdefault(moving_id, rebar_display_id(bar))
+            for segment_index, (start, end) in enumerate(
+                zip(entry["axis"][:-1], entry["axis"][1:])
+            ):
+                indices = self.candidates(start, end, float(bar.radius))
+                if not len(indices):
+                    continue
+                self.segment_tests += len(indices)
+                count = len(indices)
+                distances = _segment_distances_batch(
+                    np.repeat(start[None, :], count, axis=0),
+                    np.repeat(end[None, :], count, axis=0),
+                    self.a_array[indices],
+                    self.b_array[indices],
+                )
+                thresholds = float(bar.radius) + self.radius_array[indices] + self.clearance_mm
+                clearances = distances - thresholds
+                minimum_clearance = min(minimum_clearance, float(np.min(clearances)))
+                for local in np.flatnonzero(clearances < -1.0e-7):
+                    candidate = int(indices[int(local)])
+                    target = final_contacts.get((moving_id, int(segment_index), candidate))
+                    if (
+                        allow_final_contacts
+                        and target is not None
+                        and float(distances[int(local)]) >= target - 0.5
+                    ):
+                        continue
+                    obstacle = int(self.owner_array[candidate])
+                    moving_point, obstacle_point = _closest_segment_points(
+                        start, end, self.a_array[candidate], self.b_array[candidate]
+                    )
+                    hit = {
+                        "moving_bar_index": moving_id,
+                        "moving_bar_bim_id": self.display_by_bar[moving_id],
+                        "moving_group_id": moving_group_id,
+                        "moving_segment": int(segment_index),
+                        "obstacle_bar_index": obstacle,
+                        "obstacle_bar_bim_id": self.display_by_bar[obstacle],
+                        "obstacle_group_id": self.owner_group[candidate],
+                        "obstacle_segment": int(self.owner_segment_array[candidate]),
+                        "axis_distance_mm": float(distances[int(local)]),
+                        "required_distance_mm": float(thresholds[int(local)]),
+                        "collision_distance_mm": float(-clearances[int(local)]),
+                        "moving_contact_point_mm": _round_vector(moving_point, 5),
+                        "obstacle_contact_point_mm": _round_vector(obstacle_point, 5),
+                        "collision_position_mm": _round_vector(
+                            0.5 * (moving_point + obstacle_point), 5
+                        ),
+                    }
+                    key = (moving_id, obstacle)
+                    old = hits_by_pair.get(key)
+                    if old is None or hit["collision_distance_mm"] > old["collision_distance_mm"]:
+                        hits_by_pair[key] = hit
+        hits = list(hits_by_pair.values())
+        return not hits, hits, minimum_clearance
+
+
+def _pose_at_angle(
+    pivot: np.ndarray,
+    longitudinal: np.ndarray,
+    angle_rad: float,
+    vertical: np.ndarray | None = None,
+    lift_mm: float = 0.0,
+) -> _Pose:
+    position = np.asarray(pivot, dtype=float).copy()
+    if vertical is not None:
+        position += np.asarray(vertical, dtype=float) * float(lift_mm)
+    return _Pose(position, Rotation.from_rotvec(longitudinal * float(angle_rad)).as_quat())
+
+
+def _entries_at_pose(
+    group_ids: list[str],
+    groups: dict[str, dict],
+    bars: dict[int, Rebar],
+    pivot: np.ndarray,
+    pose: _Pose,
+) -> list[dict]:
+    return [
+        {
+            "bar": bars[int(index)],
+            "group_id": group_id,
+            "axis": _transformed_axis(bars[int(index)], pivot, pose),
+        }
+        for group_id in group_ids
+        for index in groups[group_id].get("bar_indices", [])
+    ]
+
+
+def _rotation_samples(
+    group_ids: list[str],
+    groups: dict[str, dict],
+    bars: dict[int, Rebar],
+    pivot: np.ndarray,
+    longitudinal: np.ndarray,
+    angle: float,
+    translation_step: float,
+    rotation_step: float,
+) -> int:
+    radius = 0.0
+    for group_id in group_ids:
+        for index in groups[group_id].get("bar_indices", []):
+            relative = bars[int(index)].axis - pivot
+            radial = relative - np.outer(relative @ longitudinal, longitudinal)
+            radius = max(radius, float(np.max(np.linalg.norm(radial, axis=1))))
+    sweep = abs(float(angle))
+    return max(
+        1,
+        int(math.ceil(sweep / max(rotation_step, EPS))),
+        int(math.ceil(radius * sweep / max(translation_step, EPS))),
+    )
+
+
+def _v3_phase(
+    *,
+    name: str,
+    label: str,
+    moving_ids: list[str],
+    obstacle_ids: list[str],
+    groups: dict[str, dict],
+    bars: dict[int, Rebar],
+    pivot: np.ndarray,
+    start: _Pose,
+    end: _Pose,
+    obstacle_pose: _Pose,
+    sample_count: int,
+    clearance_mm: float,
+    allow_endpoint_contacts: bool,
+    animation_offset: float,
+    animation_span: float,
+    collision_checked: bool = True,
+) -> tuple[dict, list[dict], int, int]:
+    control = [
+        _serialize_pose(start.position, start.quaternion, "阶段起点"),
+        _serialize_pose(end.position, end.quaternion, "阶段终点"),
+    ]
+    if not collision_checked:
+        return {
+            "name": name,
+            "label": label,
+            "status": "not_checked",
+            "collision_checked": False,
+            "omitted": False,
+            "moving_group_ids": list(moving_ids),
+            "obstacle_group_ids": list(obstacle_ids),
+            "pivot_local_mm": _round_vector(pivot, 5),
+            "start_pose": control[0],
+            "end_pose": control[1],
+            "control_poses": control,
+            "sample_count": sample_count + 1,
+            "translation_mm": float(np.linalg.norm(end.position - start.position)),
+            "rotation_deg": math.degrees(_pose_angle(start, end)),
+            "minimum_clearance_mm": None,
+            "collision_pair_count": 0,
+            "collision_sample_hit_count": 0,
+            "maximum_collision_distance_mm": 0.0,
+            "collisions": [],
+        }, [], 0, 0
+    obstacles = _entries_at_pose(obstacle_ids, groups, bars, pivot, obstacle_pose)
+    world = _FixedObstacleCollisionWorld(obstacles, clearance_mm)
+    endpoint = _entries_at_pose(moving_ids, groups, bars, pivot, end)
+    contacts = world.final_contacts(endpoint) if allow_endpoint_contacts else {}
+    records: dict[tuple[int, int], dict] = {}
+    minimum_clearance = math.inf
+    sample_hits = 0
+    for sample_index in range(sample_count + 1):
+        fraction = sample_index / max(sample_count, 1)
+        pose = _interpolate(start, end, fraction)
+        moving = _entries_at_pose(moving_ids, groups, bars, pivot, pose)
+        _, hits, clearance = world.check(
+            moving, contacts, allow_endpoint_contacts and sample_index == sample_count
+        )
+        minimum_clearance = min(minimum_clearance, clearance)
+        sample_hits += len(hits)
+        for hit in hits:
+            observation = {
+                "phase": name,
+                "phase_label": label,
+                "sample_index": sample_index,
+                "sample_count": sample_count,
+                "path_fraction": fraction,
+                "animation_fraction": animation_offset + animation_span * fraction,
+                "collision_pose": _serialize_pose(
+                    pose.position, pose.quaternion, "碰撞姿态"
+                ),
+                **hit,
+            }
+            key = (int(hit["moving_bar_index"]), int(hit["obstacle_bar_index"]))
+            old = records.get(key)
+            if old is None:
+                records[key] = {
+                    **observation,
+                    "first_sample_index": sample_index,
+                    "first_path_fraction": fraction,
+                    "first_animation_fraction": observation["animation_fraction"],
+                    "last_sample_index": sample_index,
+                    "last_path_fraction": fraction,
+                    "last_animation_fraction": observation["animation_fraction"],
+                    "sample_hit_count": 1,
+                    "maximum_collision_distance_mm": float(hit["collision_distance_mm"]),
+                }
+            else:
+                old["sample_hit_count"] += 1
+                old["last_sample_index"] = sample_index
+                old["last_path_fraction"] = fraction
+                old["last_animation_fraction"] = observation["animation_fraction"]
+                if hit["collision_distance_mm"] > old["maximum_collision_distance_mm"]:
+                    saved = {
+                        key: old[key] for key in (
+                            "first_sample_index", "first_path_fraction",
+                            "first_animation_fraction", "last_sample_index",
+                            "last_path_fraction", "last_animation_fraction",
+                            "sample_hit_count",
+                        )
+                    }
+                    old.update(observation)
+                    old.update(saved)
+                    old["maximum_collision_distance_mm"] = float(hit["collision_distance_mm"])
+    collisions = sorted(
+        records.values(),
+        key=lambda item: -float(item["maximum_collision_distance_mm"]),
+    )
+    return {
+        "name": name,
+        "label": label,
+        "status": "collision_detected" if collisions else "collision_free",
+        "collision_checked": True,
+        "omitted": False,
+        "moving_group_ids": list(moving_ids),
+        "obstacle_group_ids": list(obstacle_ids),
+        "pivot_local_mm": _round_vector(pivot, 5),
+        "start_pose": control[0],
+        "end_pose": control[1],
+        "control_poses": control,
+        "sample_count": sample_count + 1,
+        "translation_mm": float(np.linalg.norm(end.position - start.position)),
+        "rotation_deg": math.degrees(_pose_angle(start, end)),
+        "minimum_clearance_mm": None if math.isinf(minimum_clearance) else minimum_clearance,
+        "collision_pair_count": len(collisions),
+        "collision_sample_hit_count": sample_hits,
+        "maximum_collision_distance_mm": (
+            float(collisions[0]["maximum_collision_distance_mm"]) if collisions else 0.0
+        ),
+        "collisions": collisions,
+    }, collisions, world.pose_checks, world.segment_tests
+
+
+def _plan_mesh_group_paths_v3(
+    rebars: list[Rebar], resolved: dict, cfg: dict
+) -> dict:
+    bars = {int(bar.index): bar for bar in rebars}
+    sequence = mesh_group_sequence(resolved)
+    groups = {str(group["group_id"]): group for group in sequence}
+    pending = [group for group in sequence if not bool(group.get("preinstalled", False))]
+    installed = [
+        str(group["group_id"]) for group in sequence if bool(group.get("preinstalled", False))
+    ]
+    longitudinal = _unit(resolved.get("longitudinal_axis", [1.0, 0.0, 0.0]))
+    vertical = _unit(resolved.get("vertical_axis", [0.0, 0.0, 1.0]))
+    axis = resolved.get("assembly_rotation_axis") or {}
+    pivot = np.asarray(axis.get("point_mm", [0.0, 0.0, 0.0]), dtype=float)
+    translation_step = max(EPS, float(cfg.get("assembly_translation_step_mm", 75.0)))
+    rotation_step = max(
+        EPS, math.radians(float(cfg.get("assembly_rotation_step_deg", 7.5)))
+    )
+    clearance_mm = float(cfg.get("clearance_mm", 1.0))
+    collision_checked = not bool(cfg.get("preview_without_collision", False))
+    current_angle = 0.0
+    paths: list[dict] = []
+    pose_checks = 0
+    segment_tests = 0
+
+    for group in pending:
+        group_id = str(group["group_id"])
+        installed_before = list(installed)
+        target_angle = math.radians(
+            float(group.get("assembly_angle_deg", -float(group["plane_angle_deg"])))
+        )
+        minimum_lift = float(
+            group.get(
+                "minimum_staging_clearance_mm",
+                group.get("staging_clearance_mm", resolved.get("staging_clearance_mm", 800.0)),
+            )
+        )
+        target_pose = _pose_at_angle(pivot, longitudinal, target_angle)
+        pending_target = _entries_at_pose([group_id], groups, bars, pivot, target_pose)
+        pending_bottom = min(
+            float(np.min(entry["axis"] @ vertical)) - float(entry["bar"].radius)
+            for entry in pending_target
+        )
+        swept_top: Optional[float] = None
+        sweep_count = 0
+        effective_lift = minimum_lift
+        if installed_before:
+            sweep_count = _rotation_samples(
+                installed_before, groups, bars, pivot, longitudinal,
+                target_angle - current_angle, translation_step, rotation_step,
+            )
+            swept_top_value = -math.inf
+            sweep_start = _pose_at_angle(pivot, longitudinal, current_angle)
+            for sample_index in range(sweep_count + 1):
+                pose = _interpolate(sweep_start, target_pose, sample_index / sweep_count)
+                for entry in _entries_at_pose(installed_before, groups, bars, pivot, pose):
+                    swept_top_value = max(
+                        swept_top_value,
+                        float(np.max(entry["axis"] @ vertical)) + float(entry["bar"].radius),
+                    )
+            swept_top = float(swept_top_value)
+            effective_lift = max(
+                minimum_lift,
+                swept_top + max(0.0, clearance_mm) - pending_bottom,
+            )
+        pending_high = _pose_at_angle(
+            pivot, longitudinal, target_angle, vertical, effective_lift
+        )
+        assembly_start = _pose_at_angle(pivot, longitudinal, current_angle)
+        phases: list[dict] = []
+        collisions: list[dict] = []
+
+        if installed_before:
+            rotation_count = _rotation_samples(
+                installed_before, groups, bars, pivot, longitudinal,
+                target_angle - current_angle, translation_step, rotation_step,
+            )
+            phase, phase_collisions, checks, tests = _v3_phase(
+                name="installed_assembly_rotation",
+                label="累计已安装网片整体旋转",
+                moving_ids=installed_before,
+                obstacle_ids=[group_id],
+                groups=groups,
+                bars=bars,
+                pivot=pivot,
+                start=assembly_start,
+                end=target_pose,
+                obstacle_pose=pending_high,
+                sample_count=rotation_count,
+                clearance_mm=clearance_mm,
+                allow_endpoint_contacts=False,
+                animation_offset=0.0,
+                animation_span=0.5,
+                collision_checked=collision_checked,
+            )
+            phase["stationary_pending_pose"] = _serialize_pose(
+                pending_high.position, pending_high.quaternion, "待安装网片高位悬停态"
+            )
+            phases.append(phase)
+            collisions.extend(phase_collisions)
+            pose_checks += checks
+            segment_tests += tests
+        else:
+            omitted_pose = _serialize_pose(
+                target_pose.position, target_pose.quaternion, "省略"
+            )
+            phases.append({
+                "name": "installed_assembly_rotation",
+                "label": "累计已安装网片整体旋转",
+                "status": "not_applicable",
+                "collision_checked": False,
+                "omitted": True,
+                "reason": "当前没有累计已安装网片",
+                "moving_group_ids": [],
+                "obstacle_group_ids": [group_id],
+                "pivot_local_mm": _round_vector(pivot, 5),
+                "start_pose": omitted_pose,
+                "end_pose": omitted_pose,
+                "control_poses": [],
+                "stationary_pending_pose": _serialize_pose(
+                    pending_high.position, pending_high.quaternion, "待安装网片高位悬停态"
+                ),
+                "sample_count": 0,
+                "translation_mm": 0.0,
+                "rotation_deg": 0.0,
+                "collision_pair_count": 0,
+                "collision_sample_hit_count": 0,
+                "maximum_collision_distance_mm": 0.0,
+                "collisions": [],
+            })
+
+        descent_count = max(1, int(math.ceil(effective_lift / translation_step)))
+        descent, phase_collisions, checks, tests = _v3_phase(
+            name="pending_group_descent",
+            label="待安装网片竖直下降",
+            moving_ids=[group_id],
+            obstacle_ids=installed_before,
+            groups=groups,
+            bars=bars,
+            pivot=pivot,
+            start=pending_high,
+            end=target_pose,
+            obstacle_pose=target_pose,
+            sample_count=descent_count,
+            clearance_mm=clearance_mm,
+            allow_endpoint_contacts=True,
+            animation_offset=0.5 if installed_before else 0.0,
+            animation_span=0.5 if installed_before else 1.0,
+            collision_checked=collision_checked,
+        )
+        phases.append(descent)
+        collisions.extend(phase_collisions)
+        pose_checks += checks
+        segment_tests += tests
+        collisions.sort(key=lambda item: -float(item["maximum_collision_distance_mm"]))
+        installed.append(group_id)
+        path = {
+            "installation_step": int(group["installation_step"]),
+            "group_id": group_id,
+            "name": group.get("name", ""),
+            "bar_indices": [int(value) for value in group["bar_indices"]],
+            "path_type": "cumulative_installed_rotation_then_pending_descent",
+            "motion_model": "cumulative_installed_rotation_then_pending_descent",
+            "assembly_rotation_axis": dict(axis),
+            "pivot_local_mm": _round_vector(pivot, 5),
+            "plane_angle_deg": float(group["plane_angle_deg"]),
+            "assembly_angle_start_deg": math.degrees(current_angle),
+            "assembly_angle_target_deg": math.degrees(target_angle),
+            "installed_group_ids_before": installed_before,
+            "installed_group_ids_after": list(installed),
+            "minimum_staging_clearance_mm": minimum_lift,
+            "effective_staging_clearance_mm": effective_lift,
+            "automatic_lift_added_mm": max(0.0, effective_lift - minimum_lift),
+            "installed_sweep_max_elevation_mm": swept_top,
+            "pending_target_min_elevation_mm": pending_bottom,
+            "sweep_envelope_sample_count": sweep_count + 1 if installed_before else 0,
+            "control_poses": [
+                _serialize_pose(
+                    pending_high.position, pending_high.quaternion, "待安装网片高位初始态"
+                ),
+                _serialize_pose(target_pose.position, target_pose.quaternion, "下降完成安装态"),
+            ],
+            "phases": phases,
+            "status": (
+                "collision_detected"
+                if collisions
+                else ("collision_free" if collision_checked else "not_checked")
+            ),
+            "checked_pose_count": sum(
+                int(phase.get("sample_count", 0))
+                for phase in phases
+                if bool(phase.get("collision_checked", False))
+            ),
+            "minimum_clearance_mm": min(
+                (
+                    float(phase["minimum_clearance_mm"])
+                    for phase in phases
+                    if phase.get("minimum_clearance_mm") is not None
+                ),
+                default=None,
+            ),
+            "collision_pair_count": len({
+                (
+                    str(item["moving_group_id"]), int(item["moving_bar_index"]),
+                    str(item["obstacle_group_id"]), int(item["obstacle_bar_index"]),
+                )
+                for item in collisions
+            }),
+            "collision_record_count": len(collisions),
+            "collision_sample_hit_count": sum(
+                int(item["sample_hit_count"]) for item in collisions
+            ),
+            "maximum_collision_distance_mm": (
+                float(collisions[0]["maximum_collision_distance_mm"]) if collisions else 0.0
+            ),
+            "collisions": collisions,
+        }
+        if collisions:
+            path["first_collision"] = min(
+                collisions, key=lambda item: float(item["first_animation_fraction"])
+            )
+            path["worst_collision"] = collisions[0]
+        paths.append(path)
+        current_angle = target_angle
+
+    all_group_ids = [str(group["group_id"]) for group in sequence]
+    restore_start = _pose_at_angle(pivot, longitudinal, current_angle)
+    restore_end = _pose_at_angle(pivot, longitudinal, 0.0)
+    restore_omitted = abs(current_angle) <= 1.0e-8
+    restore_count = (
+        0 if restore_omitted else _rotation_samples(
+            all_group_ids, groups, bars, pivot, longitudinal, -current_angle,
+            translation_step, rotation_step,
+        )
+    )
+    final_restore = {
+        "name": "final_restore_rotation",
+        "label": "完整钢筋笼回正至 IFC 姿态",
+        "status": "not_applicable" if restore_omitted else "animation_only",
+        "collision_checked": False,
+        "omitted": restore_omitted,
+        "reason": (
+            "末组安装后已处于 IFC 姿态"
+            if restore_omitted else "最终整体回正按计划不做碰撞检测"
+        ),
+        "moving_group_ids": all_group_ids,
+        "obstacle_group_ids": [],
+        "pivot_local_mm": _round_vector(pivot, 5),
+        "start_pose": _serialize_pose(
+            restore_start.position, restore_start.quaternion, "整笼回正起点"
+        ),
+        "end_pose": _serialize_pose(
+            restore_end.position, restore_end.quaternion, "IFC 最终姿态"
+        ),
+        "control_poses": [] if restore_omitted else [
+            _serialize_pose(
+                restore_start.position, restore_start.quaternion, "整笼回正起点"
+            ),
+            _serialize_pose(
+                restore_end.position, restore_end.quaternion, "IFC 最终姿态"
+            ),
+        ],
+        "sample_count": 0 if restore_omitted else restore_count + 1,
+        "translation_mm": 0.0,
+        "rotation_deg": 0.0 if restore_omitted else abs(math.degrees(current_angle)),
+        "collision_pair_count": 0,
+        "collision_sample_hit_count": 0,
+        "maximum_collision_distance_mm": 0.0,
+        "collisions": [],
+    }
+    all_collisions = [item for path in paths for item in path["collisions"]]
+    collided = sum(path["status"] == "collision_detected" for path in paths)
+    unique_pairs = {
+        (
+            item["moving_group_id"], item["moving_bar_index"],
+            item["obstacle_group_id"], item["obstacle_bar_index"],
+        )
+        for item in all_collisions
+    }
+    summary = {
+        "planner": "cumulative_rigid_mesh_group_prescribed_se3",
+        "schema_version": 3,
+        "mesh_group_count": len(sequence),
+        "preinstalled_group_count": len(sequence) - len(pending),
+        "pending_group_count": len(pending),
+        "simulated_group_count": len(pending),
+        "not_evaluated_group_count": 0,
+        "collision_checked": collision_checked,
+        "collision_free_count": len(paths) - collided if collision_checked else 0,
+        "collision_detected_count": collided,
+        "collision_pair_count": len(unique_pairs),
+        "collision_record_count": len(all_collisions),
+        "collision_sample_hit_count": sum(
+            int(item["sample_hit_count"]) for item in all_collisions
+        ),
+        "maximum_collision_distance_mm": max(
+            (float(item["maximum_collision_distance_mm"]) for item in all_collisions),
+            default=0.0,
+        ),
+        "all_paths_collision_free": collided == 0 if collision_checked else None,
+        "continued_after_collision": True,
+        "pose_check_count": pose_checks,
+        "segment_pair_test_count": segment_tests,
+        "translation_discretization_mm": translation_step,
+        "rotation_discretization_deg": math.degrees(rotation_step),
+        "collision_model": "complete centerline capsules; installed groups move as one rigid assembly; internal contacts ignored",
+        "rigid_body_dof": 6,
+        "path_policy": "installed assembly rotates first; pending horizontal group only descends; final restore is animation-only",
+    }
+    return {
+        "schema_version": 3,
+        "units": "mm",
+        "frame": resolved.get("axes", {}),
+        "motion_model": "cumulative_installed_rotation_then_pending_descent",
+        "assembly_rotation_axis": dict(axis),
+        "representation": "one shared rigid transform per cumulative installed assembly; quaternion order xyzw",
+        "summary": summary,
+        "paths": paths,
+        "final_restore": final_restore,
+    }
+
+
+def _plan_mesh_group_paths_v4(
+    rebars: list[Rebar], resolved: dict, cfg: dict
+) -> dict:
+    """Plan horizontal descent followed by cumulative rotation to the next group."""
+    bars = {int(bar.index): bar for bar in rebars}
+    sequence = mesh_group_sequence(resolved)
+    groups = {str(group["group_id"]): group for group in sequence}
+    pending = [group for group in sequence if not bool(group.get("preinstalled", False))]
+    initially_installed = [
+        str(group["group_id"]) for group in sequence if bool(group.get("preinstalled", False))
+    ]
+    longitudinal = _unit(resolved.get("longitudinal_axis", [1.0, 0.0, 0.0]))
+    vertical = _unit(resolved.get("vertical_axis", [0.0, 0.0, 1.0]))
+    axis = resolved.get("assembly_rotation_axis") or {}
+    pivot = np.asarray(axis.get("point_mm", [0.0, 0.0, 0.0]), dtype=float)
+    translation_step = max(EPS, float(cfg.get("assembly_translation_step_mm", 75.0)))
+    rotation_step = max(
+        EPS, math.radians(float(cfg.get("assembly_rotation_step_deg", 7.5)))
+    )
+    clearance_mm = float(cfg.get("clearance_mm", 1.0))
+    collision_checked = not bool(cfg.get("preview_without_collision", False))
+
+    def assembly_angle(group: dict) -> float:
+        return math.radians(
+            float(group.get("assembly_angle_deg", -float(group["plane_angle_deg"])))
+        )
+
+    def wrapped_delta(start_angle: float, end_angle: float) -> float:
+        return (float(end_angle) - float(start_angle) + math.pi) % (2.0 * math.pi) - math.pi
+
+    def omitted_phase(
+        *,
+        name: str,
+        label: str,
+        reason: str,
+        moving_ids: list[str],
+        obstacle_ids: list[str],
+        start: _Pose,
+        end: _Pose,
+    ) -> dict:
+        return {
+            "name": name,
+            "label": label,
+            "status": "not_applicable",
+            "collision_checked": False,
+            "omitted": True,
+            "reason": reason,
+            "moving_group_ids": list(moving_ids),
+            "obstacle_group_ids": list(obstacle_ids),
+            "pivot_local_mm": _round_vector(pivot, 5),
+            "start_pose": _serialize_pose(start.position, start.quaternion, "省略阶段起点"),
+            "end_pose": _serialize_pose(end.position, end.quaternion, "省略阶段终点"),
+            "control_poses": [],
+            "sample_count": 0,
+            "translation_mm": 0.0,
+            "rotation_deg": 0.0,
+            "minimum_clearance_mm": None,
+            "collision_pair_count": 0,
+            "collision_sample_hit_count": 0,
+            "maximum_collision_distance_mm": 0.0,
+            "collisions": [],
+        }
+
+    def solve_staging(
+        group: dict,
+        installed_ids: list[str],
+        rotation_start_angle: float,
+    ) -> dict:
+        group_id = str(group["group_id"])
+        target_angle = assembly_angle(group)
+        target_pose = _pose_at_angle(pivot, longitudinal, target_angle)
+        target_entries = _entries_at_pose([group_id], groups, bars, pivot, target_pose)
+        pending_bottom = min(
+            float(np.min(entry["axis"] @ vertical)) - float(entry["bar"].radius)
+            for entry in target_entries
+        )
+        minimum_lift = float(
+            group.get(
+                "minimum_staging_clearance_mm",
+                group.get(
+                    "staging_clearance_mm",
+                    resolved.get("staging_clearance_mm", 800.0),
+                ),
+            )
+        )
+        effective_lift = minimum_lift
+        swept_top: Optional[float] = None
+        sweep_count = 0
+        if installed_ids:
+            delta = wrapped_delta(rotation_start_angle, target_angle)
+            sweep_count = _rotation_samples(
+                installed_ids,
+                groups,
+                bars,
+                pivot,
+                longitudinal,
+                delta,
+                translation_step,
+                rotation_step,
+            )
+            sweep_start = _pose_at_angle(pivot, longitudinal, rotation_start_angle)
+            swept_top_value = -math.inf
+            for sample_index in range(sweep_count + 1):
+                pose = _interpolate(
+                    sweep_start, target_pose, sample_index / max(sweep_count, 1)
+                )
+                for entry in _entries_at_pose(
+                    installed_ids, groups, bars, pivot, pose
+                ):
+                    swept_top_value = max(
+                        swept_top_value,
+                        float(np.max(entry["axis"] @ vertical))
+                        + float(entry["bar"].radius),
+                    )
+            swept_top = float(swept_top_value)
+            effective_lift = max(
+                minimum_lift,
+                swept_top + max(0.0, clearance_mm) - pending_bottom,
+            )
+        high_pose = _pose_at_angle(
+            pivot, longitudinal, target_angle, vertical, effective_lift
+        )
+        return {
+            "target_angle": target_angle,
+            "target_pose": target_pose,
+            "high_pose": high_pose,
+            "minimum_lift": minimum_lift,
+            "effective_lift": effective_lift,
+            "automatic_lift": max(0.0, effective_lift - minimum_lift),
+            "pending_bottom": pending_bottom,
+            "swept_top": swept_top,
+            "sweep_count": sweep_count,
+            "rotation_start_angle": rotation_start_angle,
+        }
+
+    # A group's high pose is governed by the cumulative cage rotation immediately
+    # before its descent.  Solving all stages first lets the preceding path expose
+    # the exact stationary pose of its next pending group.
+    staging: dict[str, dict] = {}
+    installed_for_stage = list(initially_installed)
+    rotation_start_angle = 0.0
+    for group in pending:
+        group_id = str(group["group_id"])
+        staging[group_id] = solve_staging(
+            group, installed_for_stage, rotation_start_angle
+        )
+        installed_for_stage.append(group_id)
+        rotation_start_angle = float(staging[group_id]["target_angle"])
+
+    pose_checks = 0
+    segment_tests = 0
+    initial_collisions: list[dict] = []
+    first_group = pending[0] if pending else None
+    if first_group is None:
+        neutral = _pose_at_angle(pivot, longitudinal, 0.0)
+        initial_preparation = omitted_phase(
+            name="initial_preparation_rotation",
+            label="初始已安装网片转向首片装配角",
+            reason="没有待安装网片",
+            moving_ids=initially_installed,
+            obstacle_ids=[],
+            start=neutral,
+            end=neutral,
+        )
+        initial_preparation.update({
+            "target_group_id": None,
+            "assembly_angle_start_deg": 0.0,
+            "assembly_angle_target_deg": 0.0,
+            "stationary_pending_pose": None,
+        })
+    else:
+        first_id = str(first_group["group_id"])
+        first_stage = staging[first_id]
+        preparation_start = _pose_at_angle(pivot, longitudinal, 0.0)
+        preparation_end = first_stage["target_pose"]
+        preparation_delta = wrapped_delta(0.0, first_stage["target_angle"])
+        if not initially_installed:
+            initial_preparation = omitted_phase(
+                name="initial_preparation_rotation",
+                label="初始已安装网片转向首片装配角",
+                reason="没有初始已安装网片，首片直接水平下降",
+                moving_ids=[],
+                obstacle_ids=[first_id],
+                start=preparation_end,
+                end=preparation_end,
+            )
+        elif abs(preparation_delta) <= 1.0e-8:
+            initial_preparation = omitted_phase(
+                name="initial_preparation_rotation",
+                label="初始已安装网片转向首片装配角",
+                reason="初始已安装网片已处于首片装配角",
+                moving_ids=initially_installed,
+                obstacle_ids=[first_id],
+                start=preparation_start,
+                end=preparation_end,
+            )
+        else:
+            preparation_samples = _rotation_samples(
+                initially_installed,
+                groups,
+                bars,
+                pivot,
+                longitudinal,
+                preparation_delta,
+                translation_step,
+                rotation_step,
+            )
+            initial_preparation, initial_collisions, checks, tests = _v3_phase(
+                name="initial_preparation_rotation",
+                label="初始已安装网片转向首片装配角",
+                moving_ids=initially_installed,
+                obstacle_ids=[first_id],
+                groups=groups,
+                bars=bars,
+                pivot=pivot,
+                start=preparation_start,
+                end=preparation_end,
+                obstacle_pose=first_stage["high_pose"],
+                sample_count=preparation_samples,
+                clearance_mm=clearance_mm,
+                allow_endpoint_contacts=False,
+                animation_offset=0.0,
+                animation_span=1.0,
+                collision_checked=collision_checked,
+            )
+            pose_checks += checks
+            segment_tests += tests
+        initial_preparation.update({
+            "target_group_id": first_id,
+            "assembly_angle_start_deg": 0.0,
+            "assembly_angle_target_deg": math.degrees(first_stage["target_angle"]),
+            "stationary_pending_pose": _serialize_pose(
+                first_stage["high_pose"].position,
+                first_stage["high_pose"].quaternion,
+                "首个待安装网片高位悬停态",
+            ),
+            "minimum_staging_clearance_mm": first_stage["minimum_lift"],
+            "effective_staging_clearance_mm": first_stage["effective_lift"],
+            "automatic_lift_added_mm": first_stage["automatic_lift"],
+            "installed_sweep_max_elevation_mm": first_stage["swept_top"],
+            "pending_target_min_elevation_mm": first_stage["pending_bottom"],
+            "sweep_envelope_sample_count": (
+                first_stage["sweep_count"] + 1 if initially_installed else 0
+            ),
+        })
+
+    installed = list(initially_installed)
+    paths: list[dict] = []
+    for pending_index, group in enumerate(pending):
+        group_id = str(group["group_id"])
+        stage = staging[group_id]
+        target_angle = float(stage["target_angle"])
+        target_pose = stage["target_pose"]
+        pending_high = stage["high_pose"]
+        installed_before = list(installed)
+        next_group = (
+            pending[pending_index + 1] if pending_index + 1 < len(pending) else None
+        )
+        next_id = str(next_group["group_id"]) if next_group is not None else None
+        phases: list[dict] = []
+        collisions: list[dict] = []
+
+        descent_count = max(
+            1, int(math.ceil(float(stage["effective_lift"]) / translation_step))
+        )
+        descent, phase_collisions, checks, tests = _v3_phase(
+            name="pending_group_descent",
+            label="待安装网片竖直下降",
+            moving_ids=[group_id],
+            obstacle_ids=installed_before,
+            groups=groups,
+            bars=bars,
+            pivot=pivot,
+            start=pending_high,
+            end=target_pose,
+            obstacle_pose=target_pose,
+            sample_count=descent_count,
+            clearance_mm=clearance_mm,
+            allow_endpoint_contacts=True,
+            animation_offset=0.0,
+            animation_span=0.5 if next_group is not None else 1.0,
+            collision_checked=collision_checked,
+        )
+        phases.append(descent)
+        collisions.extend(phase_collisions)
+        pose_checks += checks
+        segment_tests += tests
+
+        installed.append(group_id)
+        installed_after_descent = list(installed)
+        next_stage = staging[next_id] if next_id is not None else None
+        if next_stage is not None:
+            next_angle = float(next_stage["target_angle"])
+            rotation_delta = wrapped_delta(target_angle, next_angle)
+            if abs(rotation_delta) <= 1.0e-8:
+                rotation = omitted_phase(
+                    name="installed_assembly_rotation_to_next",
+                    label="累计已安装网片整体转向下一网片",
+                    reason="累计钢筋笼已处于下一网片装配角",
+                    moving_ids=installed_after_descent,
+                    obstacle_ids=[next_id],
+                    start=target_pose,
+                    end=next_stage["target_pose"],
+                )
+            else:
+                rotation_count = _rotation_samples(
+                    installed_after_descent,
+                    groups,
+                    bars,
+                    pivot,
+                    longitudinal,
+                    rotation_delta,
+                    translation_step,
+                    rotation_step,
+                )
+                rotation, phase_collisions, checks, tests = _v3_phase(
+                    name="installed_assembly_rotation_to_next",
+                    label="累计已安装网片整体转向下一网片",
+                    moving_ids=installed_after_descent,
+                    obstacle_ids=[next_id],
+                    groups=groups,
+                    bars=bars,
+                    pivot=pivot,
+                    start=target_pose,
+                    end=next_stage["target_pose"],
+                    obstacle_pose=next_stage["high_pose"],
+                    sample_count=rotation_count,
+                    clearance_mm=clearance_mm,
+                    allow_endpoint_contacts=False,
+                    animation_offset=0.5,
+                    animation_span=0.5,
+                    collision_checked=collision_checked,
+                )
+                collisions.extend(phase_collisions)
+                pose_checks += checks
+                segment_tests += tests
+            rotation["stationary_pending_pose"] = _serialize_pose(
+                next_stage["high_pose"].position,
+                next_stage["high_pose"].quaternion,
+                "下一待安装网片高位悬停态",
+            )
+            rotation["next_group_id"] = next_id
+            phases.append(rotation)
+        else:
+            next_angle = None
+            rotation = omitted_phase(
+                name="installed_assembly_rotation_to_next",
+                label="累计已安装网片整体转向下一网片",
+                reason="当前网片为最后一个待安装网片",
+                moving_ids=installed_after_descent,
+                obstacle_ids=[],
+                start=target_pose,
+                end=target_pose,
+            )
+            rotation["stationary_pending_pose"] = None
+            rotation["next_group_id"] = None
+            phases.append(rotation)
+
+        collisions.sort(
+            key=lambda item: -float(item["maximum_collision_distance_mm"])
+        )
+        control_poses = [
+            _serialize_pose(
+                pending_high.position, pending_high.quaternion, "待安装网片高位初始态"
+            ),
+            _serialize_pose(
+                target_pose.position, target_pose.quaternion, "竖直下降完成安装态"
+            ),
+        ]
+        if next_stage is not None:
+            control_poses.append(
+                _serialize_pose(
+                    next_stage["target_pose"].position,
+                    next_stage["target_pose"].quaternion,
+                    "累计整体转至下一网片装配角",
+                )
+            )
+        path = {
+            "installation_step": int(group["installation_step"]),
+            "group_id": group_id,
+            "name": group.get("name", ""),
+            "bar_indices": [int(value) for value in group["bar_indices"]],
+            "path_type": "pending_group_descent_then_cumulative_rotation",
+            "motion_model": "pending_group_descent_then_cumulative_rotation",
+            "assembly_rotation_axis": dict(axis),
+            "pivot_local_mm": _round_vector(pivot, 5),
+            "plane_angle_deg": float(group["plane_angle_deg"]),
+            "installed_group_ids_before": installed_before,
+            "installed_group_ids_after_descent": installed_after_descent,
+            "installed_group_ids_after": installed_after_descent,
+            "next_group_id": next_id,
+            "current_assembly_angle_deg": math.degrees(target_angle),
+            "next_assembly_angle_deg": (
+                math.degrees(next_angle) if next_angle is not None else None
+            ),
+            "assembly_angle_start_deg": math.degrees(target_angle),
+            "assembly_angle_target_deg": math.degrees(target_angle),
+            "assembly_angle_after_step_deg": (
+                math.degrees(next_angle)
+                if next_angle is not None
+                else math.degrees(target_angle)
+            ),
+            "minimum_staging_clearance_mm": stage["minimum_lift"],
+            "effective_staging_clearance_mm": stage["effective_lift"],
+            "automatic_lift_added_mm": stage["automatic_lift"],
+            "installed_sweep_max_elevation_mm": stage["swept_top"],
+            "pending_target_min_elevation_mm": stage["pending_bottom"],
+            "sweep_envelope_sample_count": (
+                stage["sweep_count"] + 1 if installed_before else 0
+            ),
+            "pending_high_pose": control_poses[0],
+            "pending_target_pose": control_poses[1],
+            "next_pending_high_pose": (
+                _serialize_pose(
+                    next_stage["high_pose"].position,
+                    next_stage["high_pose"].quaternion,
+                    "下一待安装网片高位悬停态",
+                )
+                if next_stage is not None
+                else None
+            ),
+            "next_minimum_staging_clearance_mm": (
+                next_stage["minimum_lift"] if next_stage is not None else None
+            ),
+            "next_effective_staging_clearance_mm": (
+                next_stage["effective_lift"] if next_stage is not None else None
+            ),
+            "next_automatic_lift_added_mm": (
+                next_stage["automatic_lift"] if next_stage is not None else None
+            ),
+            "next_installed_sweep_max_elevation_mm": (
+                next_stage["swept_top"] if next_stage is not None else None
+            ),
+            "next_sweep_envelope_sample_count": (
+                next_stage["sweep_count"] + 1 if next_stage is not None else 0
+            ),
+            "control_poses": control_poses,
+            "phases": phases,
+            "status": (
+                "collision_detected"
+                if collisions
+                else ("collision_free" if collision_checked else "not_checked")
+            ),
+            "checked_pose_count": sum(
+                int(phase.get("sample_count", 0))
+                for phase in phases
+                if bool(phase.get("collision_checked", False))
+            ),
+            "minimum_clearance_mm": min(
+                (
+                    float(phase["minimum_clearance_mm"])
+                    for phase in phases
+                    if phase.get("minimum_clearance_mm") is not None
+                ),
+                default=None,
+            ),
+            "collision_pair_count": len({
+                (
+                    str(item["moving_group_id"]),
+                    int(item["moving_bar_index"]),
+                    str(item["obstacle_group_id"]),
+                    int(item["obstacle_bar_index"]),
+                )
+                for item in collisions
+            }),
+            "collision_record_count": len(collisions),
+            "collision_sample_hit_count": sum(
+                int(item["sample_hit_count"]) for item in collisions
+            ),
+            "maximum_collision_distance_mm": (
+                float(collisions[0]["maximum_collision_distance_mm"])
+                if collisions
+                else 0.0
+            ),
+            "collisions": collisions,
+        }
+        if collisions:
+            path["first_collision"] = min(
+                collisions, key=lambda item: float(item["first_animation_fraction"])
+            )
+            path["worst_collision"] = collisions[0]
+        paths.append(path)
+
+    final_angle = (
+        float(staging[str(pending[-1]["group_id"])]["target_angle"])
+        if pending
+        else 0.0
+    )
+    all_group_ids = [str(group["group_id"]) for group in sequence]
+    restore_start = _pose_at_angle(pivot, longitudinal, final_angle)
+    restore_end = _pose_at_angle(pivot, longitudinal, 0.0)
+    restore_delta = wrapped_delta(final_angle, 0.0)
+    restore_omitted = abs(restore_delta) <= 1.0e-8
+    restore_count = (
+        0
+        if restore_omitted
+        else _rotation_samples(
+            all_group_ids,
+            groups,
+            bars,
+            pivot,
+            longitudinal,
+            restore_delta,
+            translation_step,
+            rotation_step,
+        )
+    )
+    final_restore = {
+        "name": "final_restore_rotation",
+        "label": "完整钢筋笼回正至 IFC 姿态",
+        "status": "not_applicable" if restore_omitted else "animation_only",
+        "collision_checked": False,
+        "omitted": restore_omitted,
+        "reason": (
+            "末组安装后已处于 IFC 姿态"
+            if restore_omitted
+            else "最终整体回正按计划不做碰撞检测"
+        ),
+        "moving_group_ids": all_group_ids,
+        "obstacle_group_ids": [],
+        "pivot_local_mm": _round_vector(pivot, 5),
+        "start_pose": _serialize_pose(
+            restore_start.position, restore_start.quaternion, "整笼回正起点"
+        ),
+        "end_pose": _serialize_pose(
+            restore_end.position, restore_end.quaternion, "IFC 最终姿态"
+        ),
+        "control_poses": (
+            []
+            if restore_omitted
+            else [
+                _serialize_pose(
+                    restore_start.position, restore_start.quaternion, "整笼回正起点"
+                ),
+                _serialize_pose(
+                    restore_end.position, restore_end.quaternion, "IFC 最终姿态"
+                ),
+            ]
+        ),
+        "sample_count": 0 if restore_omitted else restore_count + 1,
+        "translation_mm": 0.0,
+        "rotation_deg": 0.0 if restore_omitted else math.degrees(abs(restore_delta)),
+        "minimum_clearance_mm": None,
+        "collision_pair_count": 0,
+        "collision_sample_hit_count": 0,
+        "maximum_collision_distance_mm": 0.0,
+        "collisions": [],
+    }
+
+    path_collisions = [item for path in paths for item in path["collisions"]]
+    all_collisions = list(initial_collisions) + path_collisions
+    collided_paths = sum(path["status"] == "collision_detected" for path in paths)
+    initial_collided = bool(initial_collisions)
+    unique_pairs = {
+        (
+            item["moving_group_id"],
+            item["moving_bar_index"],
+            item["obstacle_group_id"],
+            item["obstacle_bar_index"],
+        )
+        for item in all_collisions
+    }
+    checked_phases = [
+        phase
+        for phase in [initial_preparation]
+        + [phase for path in paths for phase in path["phases"]]
+        if bool(phase.get("collision_checked", False))
+    ]
+    collision_phase_count = sum(
+        phase.get("status") == "collision_detected" for phase in checked_phases
+    )
+    summary = {
+        "planner": "cumulative_rigid_mesh_group_prescribed_se3",
+        "schema_version": 4,
+        "mesh_group_count": len(sequence),
+        "preinstalled_group_count": len(initially_installed),
+        "pending_group_count": len(pending),
+        "simulated_group_count": len(pending),
+        "not_evaluated_group_count": 0,
+        "collision_checked": collision_checked,
+        "collision_free_count": len(paths) - collided_paths if collision_checked else 0,
+        "collision_detected_count": collided_paths + int(initial_collided),
+        "collision_detected_path_count": collided_paths,
+        "collision_detected_phase_count": collision_phase_count,
+        "initial_preparation_collision_detected": initial_collided,
+        "collision_pair_count": len(unique_pairs),
+        "collision_record_count": len(all_collisions),
+        "collision_sample_hit_count": sum(
+            int(item["sample_hit_count"]) for item in all_collisions
+        ),
+        "maximum_collision_distance_mm": max(
+            (
+                float(item["maximum_collision_distance_mm"])
+                for item in all_collisions
+            ),
+            default=0.0,
+        ),
+        "all_paths_collision_free": (
+            collision_phase_count == 0 if collision_checked else None
+        ),
+        "all_collision_checked_phases_free": (
+            collision_phase_count == 0 if collision_checked else None
+        ),
+        "continued_after_collision": True,
+        "pose_check_count": pose_checks,
+        "segment_pair_test_count": segment_tests,
+        "translation_discretization_mm": translation_step,
+        "rotation_discretization_deg": math.degrees(rotation_step),
+        "collision_model": (
+            "complete centerline capsules; installed groups move as one rigid "
+            "assembly; internal contacts ignored"
+        ),
+        "rigid_body_dof": 6,
+        "path_policy": (
+            "initial preparation when needed; pending horizontal group descends "
+            "first; cumulative installed assembly then rotates to the next group; "
+            "final restore is animation-only"
+        ),
+    }
+    return {
+        "schema_version": 4,
+        "units": "mm",
+        "frame": resolved.get("axes", {}),
+        "motion_model": "pending_group_descent_then_cumulative_rotation",
+        "assembly_rotation_axis": dict(axis),
+        "representation": (
+            "one shared rigid transform per cumulative installed assembly; "
+            "quaternion order xyzw"
+        ),
+        "summary": summary,
+        "initial_preparation": initial_preparation,
+        "paths": paths,
+        "final_restore": final_restore,
+    }
+
+
 def plan_mesh_group_paths(
     rebars: list[Rebar],
     resolved: dict,
     cfg: dict,
 ) -> dict:
     """Check the prescribed horizontal/drop/rotate path for every pending group."""
+    if int(resolved.get("schema_version", 2)) >= 4:
+        return _plan_mesh_group_paths_v4(rebars, resolved, cfg)
+    if int(resolved.get("schema_version", 2)) == 3:
+        return _plan_mesh_group_paths_v3(rebars, resolved, cfg)
     by_index = {int(bar.index): bar for bar in rebars}
     groups = mesh_group_sequence(resolved)
     group_by_bar = {

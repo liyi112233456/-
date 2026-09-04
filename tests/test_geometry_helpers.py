@@ -51,6 +51,17 @@ END-ISO-10303-21;
     assert bars[0].radius == 6.0
     assert np.allclose(bars[0].axis[[0, -1]], [[0.0, 0.0, 0.0], [100.0, 0.0, 0.0]])
 
+    from app.services.ifc_geometry import parse_ifc_rebar_models
+    from app.services.mesh_groups import rebar_model_fingerprint
+
+    combined, combined_types, combined_meta = parse_ifc_rebar_models(
+        [(path, "direct.ifc")]
+    )
+    assert rebar_model_fingerprint(combined) == rebar_model_fingerprint(bars)
+    assert combined[0].index == bars[0].index
+    assert combined[0].map_id == bars[0].map_id
+    assert combined_meta["source_file_count"] == 1
+
 
 
 def test_sample_trimmed_circle_curve(tmp_path):

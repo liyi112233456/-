@@ -12,7 +12,7 @@ import numpy as np
 
 from .config import JOBS_DIR
 from .services.assembly_path import plan_assembly_paths
-from .services.ifc_geometry import Rebar, parse_ifc_rebars
+from .services.ifc_geometry import Rebar, parse_ifc_rebar_models
 from .services.mesh_groups import (
     plan_mesh_group_paths,
     rebar_model_fingerprint,
@@ -38,10 +38,38 @@ def _make_bundle(job_dir: Path) -> Path:
     bundle = job_dir / "result_bundle.zip"
     with zipfile.ZipFile(bundle, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for path in sorted(job_dir.rglob("*")):
-            if not path.is_file() or path == bundle or path.name == "input.ifc":
+            relative = path.relative_to(job_dir)
+            if (
+                not path.is_file()
+                or path == bundle
+                or path.name in {"input.ifc", "input_models.json"}
+                or (relative.parts and relative.parts[0] == "input_models")
+            ):
                 continue
             zf.write(path, path.relative_to(job_dir))
     return bundle
+
+
+def _job_ifc_models(job_dir: Path) -> list[tuple[Path, str]]:
+    """Return persisted IFC models in the same order used during preview."""
+    manifest_path = job_dir / "input_models.json"
+    if not manifest_path.is_file():
+        return [(job_dir / "input.ifc", "input.ifc")]
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    models = payload.get("models")
+    if not isinstance(models, list) or not models:
+        raise ValueError("多 IFC 输入清单为空或格式无效")
+    result: list[tuple[Path, str]] = []
+    root = job_dir.resolve()
+    for item in models:
+        if not isinstance(item, dict):
+            raise ValueError("多 IFC 输入清单包含无效项目")
+        relative = Path(str(item.get("path") or ""))
+        path = (job_dir / relative).resolve()
+        if root not in path.parents or not path.is_file():
+            raise ValueError(f"多 IFC 输入模型不存在或路径无效: {relative}")
+        result.append((path, str(item.get("source_filename") or path.name)))
+    return result
 
 
 def run_planning_job(task_id: str) -> None:
@@ -50,7 +78,6 @@ def run_planning_job(task_id: str) -> None:
     if not task:
         raise RuntimeError(f"Unknown task {task_id}")
     job_dir = JOBS_DIR / task_id
-    input_path = job_dir / "input.ifc"
     output_dir = job_dir / "output"
     robot_dir = output_dir / "robot"
     options = task["options"]
@@ -64,8 +91,8 @@ def run_planning_job(task_id: str) -> None:
     try:
         update_task(task_id, status="running", stage="startup", progress=0.01, message="后台计算进程已启动", error=None)
         log("planning job started")
-        rebars, type_axes, meta = parse_ifc_rebars(
-            input_path,
+        rebars, type_axes, meta = parse_ifc_rebar_models(
+            _job_ifc_models(job_dir),
             float(options.get("axis_simplify_mm", 0.75)),
             progress=cb,
         )
@@ -82,7 +109,11 @@ def run_planning_job(task_id: str) -> None:
                 payload,
                 model_fingerprint=fingerprint,
             )
-            cb("collision", 0.70, "检查网片组竖直下降和定轴旋转路径")
+            cb(
+                "collision",
+                0.70,
+                "检查首片准备、当前网片竖直下降和累计钢筋笼转向下一片路径",
+            )
             mesh_group_paths = plan_mesh_group_paths(rebars, resolved_groups, options)
             summary = save_mesh_group_outputs(
                 output_dir,

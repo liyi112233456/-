@@ -740,3 +740,115 @@ def parse_ifc_rebars(path: Path, simplify_mm: float = 0.75, progress: Optional[P
     }
     cb("instantiate", 0.52, f"识别到 {len(rebars)} 根钢筋")
     return rebars, type_axes, meta
+
+
+def parse_ifc_rebar_models(
+    models: Sequence[tuple[Path, str]],
+    simplify_mm: float = 0.75,
+    progress: Optional[Progress] = None,
+) -> tuple[list[Rebar], dict[int, TypeAxis], dict]:
+    """Parse one or more IFC files into one index-stable rebar model.
+
+    Every input file keeps its original world coordinates. Rebar indices and
+    representation-map ids are made unique across files, while BIM-facing
+    names, tags, GUIDs and entity ids remain unchanged. ``source_models`` in
+    the returned metadata records the exact bar indices belonging to each IFC.
+    """
+    if not models:
+        raise ValueError("至少需要一个 IFC 模型")
+    cb = progress or (lambda *_: None)
+    if len(models) == 1:
+        path, source_filename = models[0]
+        rebars, type_axes, meta = parse_ifc_rebars(
+            path,
+            simplify_mm=simplify_mm,
+            progress=cb,
+        )
+        return rebars, type_axes, {
+            **meta,
+            "source_file_count": 1,
+            "source_models": [{
+                "source_filename": source_filename,
+                "rebar_count": len(rebars),
+                "bar_indices": [bar.index for bar in rebars],
+                "ifc_schema": meta.get("ifc_schema", "unknown"),
+            }],
+        }
+    combined_rebars: list[Rebar] = []
+    combined_type_axes: dict[int, TypeAxis] = {}
+    source_models: list[dict] = []
+    metas: list[dict] = []
+
+    for file_position, (path, source_filename) in enumerate(models, 1):
+        def file_progress(stage: str, value: float, message: str) -> None:
+            fraction = ((file_position - 1) + min(max(float(value), 0.0), 0.52) / 0.52) / len(models)
+            cb(stage, min(0.52, 0.52 * fraction), f"[{file_position}/{len(models)}] {message}")
+
+        bars, type_axes, meta = parse_ifc_rebars(
+            path,
+            simplify_mm=simplify_mm,
+            progress=file_progress,
+        )
+        metas.append(meta)
+        map_ids = sorted({*type_axes, *(bar.map_id for bar in bars)})
+        map_id_lookup = {
+            old_id: file_position * 1_000_000_000 + ordinal
+            for ordinal, old_id in enumerate(map_ids, 1)
+        }
+        for old_id, type_axis in type_axes.items():
+            new_id = map_id_lookup[old_id]
+            combined_type_axes[new_id] = TypeAxis(
+                map_id=new_id,
+                axis=np.asarray(type_axis.axis, dtype=float),
+                radius=float(type_axis.radius),
+                vertex_count=int(type_axis.vertex_count),
+                face_count=int(type_axis.face_count),
+                station_count=int(type_axis.station_count),
+                method=str(type_axis.method),
+            )
+
+        indices: list[int] = []
+        for bar in bars:
+            new_index = len(combined_rebars)
+            indices.append(new_index)
+            combined_rebars.append(Rebar(
+                index=new_index,
+                entity_id=int(bar.entity_id),
+                guid=bar.guid,
+                name=bar.name,
+                tag=bar.tag,
+                map_id=map_id_lookup.get(bar.map_id, file_position * 1_000_000_000),
+                axis=np.asarray(bar.axis, dtype=float),
+                radius=float(bar.radius),
+                bbox_min=np.asarray(bar.bbox_min, dtype=float),
+                bbox_max=np.asarray(bar.bbox_max, dtype=float),
+                length=float(bar.length),
+            ))
+        source_models.append({
+            "source_filename": source_filename,
+            "rebar_count": len(indices),
+            "bar_indices": indices,
+            "ifc_schema": meta.get("ifc_schema", "unknown"),
+        })
+
+    schemas = sorted({str(meta.get("ifc_schema", "unknown")) for meta in metas})
+    failures = {
+        f"{position}:{map_id}": message
+        for position, meta in enumerate(metas, 1)
+        for map_id, message in (meta.get("map_failures") or {}).items()
+    }
+    combined_meta = {
+        "ifc_schema": schemas[0] if len(schemas) == 1 else "+".join(schemas),
+        "entity_count": sum(int(meta.get("entity_count", 0)) for meta in metas),
+        "representation_map_count": sum(int(meta.get("representation_map_count", 0)) for meta in metas),
+        "axis_type_count": len(combined_type_axes),
+        "map_failure_count": len(failures),
+        "map_failures": failures,
+        "direct_geometry_product_count": sum(
+            int(meta.get("direct_geometry_product_count", 0)) for meta in metas
+        ),
+        "source_file_count": len(source_models),
+        "source_models": source_models,
+    }
+    cb("instantiate", 0.52, f"已合并 {len(models)} 个 IFC，共识别到 {len(combined_rebars)} 根钢筋")
+    return combined_rebars, combined_type_axes, combined_meta

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import math
 import os
 import re
 import shutil
@@ -22,9 +23,17 @@ from starlette.background import BackgroundTask
 
 from .config import JOBS_DIR, MAX_UPLOAD_MB
 from .models import PlanningOptions, RobotPathRequest
-from .services.ifc_geometry import parse_ifc_rebars, rebar_display_id
+from .services.ifc_geometry import (
+    parse_ifc_rebar_models,
+    parse_ifc_rebars,
+    rebar_display_id,
+)
 from .services.manual_sequence_workbook import build_manual_sequence_workbook
-from .services.mesh_groups import rebar_model_fingerprint, resolve_mesh_groups
+from .services.mesh_groups import (
+    plan_mesh_group_paths,
+    rebar_model_fingerprint,
+    resolve_mesh_groups,
+)
 from .task_store import create_task, get_task, init_db, list_tasks
 
 APP_DIR = Path(__file__).resolve().parent
@@ -39,7 +48,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     lifespan=lifespan,
     title="钢筋空间拓扑规划与碰撞检测系统",
-    version="1.6.2",
+    version="1.9.0",
     description="IFC 钢筋轴线恢复、多方向空间拓扑、Excel/可视化人工顺序、钢筋网片组刚体安装和六自由度碰撞检查。",
 )
 app.add_middleware(GZipMiddleware, minimum_size=1024)
@@ -68,6 +77,167 @@ def public_task(task: dict) -> dict:
     return result
 
 
+MESH_GROUP_SCHEMA_VERSION = 4
+MESH_GROUP_MOTION_MODEL = "pending_group_descent_then_cumulative_rotation"
+LEGACY_MESH_GROUP_MOTION_MODEL = "cumulative_installed_rotation_then_pending_descent"
+MULTI_IFC_MANIFEST = "input_models.json"
+
+
+async def _save_task_ifc_uploads(
+    uploads: list[UploadFile], job_dir: Path
+) -> tuple[int, list[dict]]:
+    """Save uploaded IFC/IFCZIP models and return a stable parse manifest."""
+    if not uploads:
+        raise HTTPException(400, "请选择 IFC 文件")
+    total_uploaded = 0
+    models: list[dict] = []
+    extra_dir = job_dir / "input_models"
+    for position, upload in enumerate(uploads, 1):
+        source_filename = upload.filename or f"model_{position}.ifc"
+        suffix = Path(source_filename).suffix.lower()
+        if suffix not in {".ifc", ".ifczip"}:
+            raise HTTPException(400, f"{source_filename}：仅支持 .ifc 或 .ifczip 文件")
+        target = job_dir / "input.ifc" if position == 1 else extra_dir / f"{position:04d}.ifc"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        uploaded_path = target if suffix == ".ifc" else target.with_suffix(".ifczip")
+        with uploaded_path.open("wb") as stream:
+            while chunk := await upload.read(1024 * 1024):
+                total_uploaded += len(chunk)
+                if total_uploaded > MAX_UPLOAD_MB * 1024 * 1024:
+                    raise HTTPException(413, f"全部 IFC 文件总大小超过 {MAX_UPLOAD_MB} MB")
+                stream.write(chunk)
+        if suffix == ".ifczip":
+            try:
+                with zipfile.ZipFile(uploaded_path) as archive:
+                    members = [
+                        info for info in archive.infolist()
+                        if not info.is_dir() and info.filename.lower().endswith(".ifc")
+                    ]
+                    if not members:
+                        raise HTTPException(400, f"{source_filename}：IFCZIP 中未找到 .ifc 模型")
+                    extracted_size = 0
+                    with archive.open(members[0]) as source, target.open("wb") as output:
+                        while chunk := source.read(1024 * 1024):
+                            extracted_size += len(chunk)
+                            if extracted_size > MAX_UPLOAD_MB * 1024 * 1024:
+                                raise HTTPException(413, f"{source_filename}：解压后的 IFC 超过 {MAX_UPLOAD_MB} MB")
+                            output.write(chunk)
+            except zipfile.BadZipFile as exc:
+                raise HTTPException(400, f"{source_filename}：IFCZIP 损坏或格式无效") from exc
+            finally:
+                uploaded_path.unlink(missing_ok=True)
+        models.append({
+            "path": target.relative_to(job_dir).as_posix(),
+            "source_filename": source_filename,
+        })
+    if len(models) > 1:
+        (job_dir / MULTI_IFC_MANIFEST).write_text(
+            json.dumps(
+                {"input_mode": "multiple_ifc_mesh_groups", "models": models},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    return total_uploaded, models
+
+
+def _validate_mesh_group_payload(payload: object, *, current_only: bool = True) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError("JSON 顶层必须是对象")
+    if payload.get("mode") != "mesh_groups":
+        raise ValueError("mode 必须是 mesh_groups")
+    raw_schema_version = payload.get("schema_version", 0)
+    if isinstance(raw_schema_version, bool):
+        raise ValueError("schema_version 必须是整数")
+    try:
+        numeric_schema_version = float(raw_schema_version)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("schema_version 必须是整数") from exc
+    if not math.isfinite(numeric_schema_version) or not numeric_schema_version.is_integer():
+        raise ValueError("schema_version 必须是整数")
+    schema_version = int(numeric_schema_version)
+    accepted = {MESH_GROUP_SCHEMA_VERSION} if current_only else {2, 3, MESH_GROUP_SCHEMA_VERSION}
+    if schema_version not in accepted:
+        if current_only:
+            raise ValueError(f"schema_version 必须是 {MESH_GROUP_SCHEMA_VERSION}")
+        raise ValueError("schema_version 必须是 2、3 或 4")
+    if schema_version == MESH_GROUP_SCHEMA_VERSION:
+        motion_model = payload.get("motion_model")
+        if motion_model != MESH_GROUP_MOTION_MODEL:
+            raise ValueError(f"motion_model 必须是 {MESH_GROUP_MOTION_MODEL}")
+        axis = payload.get("assembly_rotation_axis")
+        if axis is not None and not isinstance(axis, dict):
+            raise ValueError("assembly_rotation_axis 必须是对象或 null")
+    elif schema_version == 3:
+        motion_model = payload.get("motion_model")
+        if motion_model != LEGACY_MESH_GROUP_MOTION_MODEL:
+            raise ValueError(f"版本 3 的 motion_model 必须是 {LEGACY_MESH_GROUP_MOTION_MODEL}")
+        axis = payload.get("assembly_rotation_axis")
+        if axis is not None and not isinstance(axis, dict):
+            raise ValueError("assembly_rotation_axis 必须是对象或 null")
+    groups = payload.get("groups")
+    if not isinstance(groups, list) or not groups:
+        raise ValueError("groups 必须是非空数组")
+    return payload
+
+
+def _migrate_mesh_group_payload(payload: object) -> tuple[dict, int | None]:
+    """Convert saved v2/v3 group definitions to the v4 assembly motion model."""
+    source = _validate_mesh_group_payload(payload, current_only=False)
+    source_version = int(source["schema_version"])
+    if source_version == MESH_GROUP_SCHEMA_VERSION:
+        return source, None
+
+    migrated_groups: list[dict] = []
+    for source_group in source["groups"]:
+        if not isinstance(source_group, dict):
+            raise ValueError("groups 中的每个网片组必须是对象")
+        migrated_groups.append({
+            "group_id": source_group.get("group_id"),
+            "name": source_group.get("name", ""),
+            "installation_step": source_group.get(
+                "installation_step", source_group.get("step")
+            ),
+            "installation_status": (
+                "preinstalled"
+                if bool(source_group.get("preinstalled", False))
+                else source_group.get(
+                    "installation_status", source_group.get("status", "pending")
+                )
+            ),
+            "bar_indices": source_group.get("bar_indices", []),
+            "plane_angle_deg": source_group.get("plane_angle_deg"),
+            "staging_clearance_mm": source_group.get(
+                "minimum_staging_clearance_mm",
+                source_group.get("staging_clearance_mm"),
+            ),
+        })
+
+    assembly_axis = (
+        source.get("assembly_rotation_axis")
+        if source_version == 3
+        else {
+            "transverse_mm": None,
+            "elevation_mm": None,
+            "direction": None,
+        }
+    )
+    migrated = {
+        "mode": "mesh_groups",
+        "schema_version": MESH_GROUP_SCHEMA_VERSION,
+        "motion_model": MESH_GROUP_MOTION_MODEL,
+        "model_fingerprint": source.get("model_fingerprint"),
+        "longitudinal_axis": source.get("longitudinal_axis", "auto"),
+        "vertical_axis": source.get("vertical_axis", [0, 0, 1]),
+        "staging_clearance_mm": source.get("staging_clearance_mm", 800),
+        "assembly_rotation_axis": assembly_axis,
+        "groups": migrated_groups,
+        "migrated_from_schema_version": source_version,
+    }
+    return _validate_mesh_group_payload(migrated), source_version
+
+
 @app.get("/api/tasks")
 def tasks(limit: int = 50) -> list[dict]:
     return [public_task(t) for t in list_tasks(min(max(limit, 1), 200))]
@@ -83,31 +253,25 @@ def task_detail(task_id: str) -> dict:
 
 @app.post("/api/tasks", status_code=202)
 async def create_planning_task(
-    file: Annotated[UploadFile, File(...)],
+    file: Annotated[list[UploadFile], File(...)],
     options_json: Annotated[str, Form()] = "{}",
     sequence_file: Annotated[UploadFile | None, File()] = None,
     visual_sequence_json: Annotated[str | None, Form()] = None,
 ) -> dict:
-    suffix = Path(file.filename or "model.ifc").suffix.lower()
-    if suffix not in {".ifc", ".ifczip"}:
-        raise HTTPException(400, "仅支持 .ifc 或 .ifczip 文件")
     try:
         raw_options = json.loads(options_json or "{}")
         options = PlanningOptions.model_validate(raw_options)
     except Exception as exc:
         raise HTTPException(422, f"规划参数无效: {exc}") from exc
+    uploads = list(file or [])
+    if len(uploads) > 1 and options.sequence_source != "visual_groups":
+        raise HTTPException(400, "多个 IFC 文件仅用于可视化网片组顺序；其他模式请选择一个完整 IFC")
     task_id = uuid.uuid4().hex
     job_dir = JOBS_DIR / task_id
     job_dir.mkdir(parents=True, exist_ok=False)
-    input_path = job_dir / "input.ifc"
     size = 0
     try:
-        with input_path.open("wb") as stream:
-            while chunk := await file.read(1024 * 1024):
-                size += len(chunk)
-                if size > MAX_UPLOAD_MB * 1024 * 1024:
-                    raise HTTPException(413, f"文件超过 {MAX_UPLOAD_MB} MB")
-                stream.write(chunk)
+        size, saved_models = await _save_task_ifc_uploads(uploads, job_dir)
         if options.sequence_source == "excel":
             if sequence_file is None or not sequence_file.filename:
                 raise HTTPException(400, "An Excel sequence file is required in excel mode")
@@ -136,13 +300,7 @@ async def create_planning_task(
                 if not isinstance(visual_payload, dict):
                     raise ValueError("JSON 顶层必须是对象")
                 if options.sequence_source == "visual_groups":
-                    if visual_payload.get("mode") != "mesh_groups":
-                        raise ValueError("mode 必须是 mesh_groups")
-                    if int(visual_payload.get("schema_version", 0)) != 2:
-                        raise ValueError("schema_version 必须是 2")
-                    groups = visual_payload.get("groups")
-                    if not isinstance(groups, list) or not groups:
-                        raise ValueError("groups 必须是非空数组")
+                    visual_payload = _validate_mesh_group_payload(visual_payload)
                     # Group installation does not have a single-bar TCP/gripper
                     # definition, so controller exports are intentionally disabled.
                     options.generate_assembly_paths = True
@@ -163,7 +321,11 @@ async def create_planning_task(
     except Exception:
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
-    create_task(task_id, file.filename or "model.ifc", options.model_dump())
+    if len(saved_models) == 1:
+        task_filename = saved_models[0]["source_filename"]
+    else:
+        task_filename = f"{saved_models[0]['source_filename']} 等 {len(saved_models)} 个网片 IFC"
+    create_task(task_id, task_filename, options.model_dump())
     launch_worker("planning", task_id)
     return {"task_id": task_id, "status": "queued", "size_bytes": size}
 
@@ -191,13 +353,9 @@ def rerun_mesh_group_task(task_id: str) -> dict:
     if not sequence_path.is_file():
         raise HTTPException(409, "历史任务的网片分组与安装顺序已不存在，无法重新计算")
     try:
-        payload = json.loads(sequence_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict) or payload.get("mode") != "mesh_groups":
-            raise ValueError("mode 必须是 mesh_groups")
-        if int(payload.get("schema_version", 0)) != 2:
-            raise ValueError("schema_version 必须是 2")
-        if not isinstance(payload.get("groups"), list) or not payload["groups"]:
-            raise ValueError("groups 必须是非空数组")
+        payload, migrated_from = _migrate_mesh_group_payload(
+            json.loads(sequence_path.read_text(encoding="utf-8"))
+        )
     except Exception as exc:
         raise HTTPException(409, f"历史任务的网片配置无效: {exc}") from exc
 
@@ -214,6 +372,12 @@ def rerun_mesh_group_task(task_id: str) -> dict:
     new_dir.mkdir(parents=True, exist_ok=False)
     try:
         shutil.copy2(source_ifc, new_dir / "input.ifc")
+        source_manifest = source_dir / MULTI_IFC_MANIFEST
+        if source_manifest.is_file():
+            shutil.copy2(source_manifest, new_dir / MULTI_IFC_MANIFEST)
+            source_models_dir = source_dir / "input_models"
+            if source_models_dir.is_dir():
+                shutil.copytree(source_models_dir, new_dir / "input_models")
         (new_dir / "input_sequence.json").write_text(
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
@@ -229,6 +393,8 @@ def rerun_mesh_group_task(task_id: str) -> dict:
         "source_task_id": task_id,
         "status": "queued",
         "reused_mesh_groups": True,
+        "schema_version": MESH_GROUP_SCHEMA_VERSION,
+        "migrated_from_schema_version": migrated_from,
         "message": "已复用原 IFC、网片分组和安装顺序创建新计算任务",
     }
 
@@ -277,18 +443,41 @@ def _save_uploaded_ifc_for_sequence(file: UploadFile, temp_dir: Path) -> tuple[P
 
 @app.post("/api/sequence/preview")
 def preview_visual_sequence(
-    file: Annotated[UploadFile, File(...)],
+    file: Annotated[list[UploadFile], File(...)],
     visual_sequence_json: Annotated[str | None, Form()] = None,
 ) -> dict:
-    """Parse an IFC into the lightweight model used by the visual order editor."""
+    """Parse one or more IFCs into the visual mesh/order editor model."""
     temp_dir = Path(tempfile.mkdtemp(prefix="visual_sequence_", dir=JOBS_DIR))
     try:
-        input_path, source_name = _save_uploaded_ifc_for_sequence(file, temp_dir)
-        rebars, _, ifc_meta = parse_ifc_rebars(input_path)
+        uploads = list(file or [])
+        if not uploads:
+            raise HTTPException(400, "请选择 IFC 文件")
+        parsed_models: list[tuple[Path, str]] = []
+        for position, upload in enumerate(uploads, 1):
+            model_dir = temp_dir / f"model_{position:04d}"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            input_path, source_name = _save_uploaded_ifc_for_sequence(upload, model_dir)
+            parsed_models.append((input_path, source_name))
+        rebars, _, ifc_meta = parse_ifc_rebar_models(parsed_models)
         fingerprint = rebar_model_fingerprint(rebars)
+        source_names = [source_name for _, source_name in parsed_models]
+        suggested_groups = [
+            {
+                "group_id": f"G{position:03d}",
+                "name": Path(source["source_filename"]).stem or f"网片组 {position}",
+                "installation_step": position,
+                "installation_status": "pending",
+                "bar_indices": source["bar_indices"],
+                "source_filename": source["source_filename"],
+            }
+            for position, source in enumerate(ifc_meta.get("source_models", []), 1)
+        ] if len(parsed_models) > 1 else []
         response = {
             "units": "mm",
-            "source_filename": source_name,
+            "source_filename": source_names[0] if len(source_names) == 1 else f"{source_names[0]} 等 {len(source_names)} 个 IFC",
+            "source_filenames": source_names,
+            "mesh_group_input_mode": "multiple_ifc_files" if len(source_names) > 1 else "single_complete_ifc",
+            "suggested_mesh_groups": suggested_groups,
             "model_fingerprint": fingerprint,
             "bars": [
                 {
@@ -316,11 +505,30 @@ def preview_visual_sequence(
                 raise HTTPException(422, f"可视化钢筋网片组 JSON 格式无效: {exc}") from exc
             if not isinstance(payload, dict) or payload.get("mode") != "mesh_groups":
                 raise HTTPException(422, "网片组预览的 mode 必须是 mesh_groups")
-            response["mesh_groups"] = resolve_mesh_groups(
+            mesh_groups = resolve_mesh_groups(
                 rebars,
                 payload,
                 model_fingerprint=fingerprint,
             )
+            preview_paths = plan_mesh_group_paths(
+                rebars,
+                mesh_groups,
+                {
+                    "clearance_mm": float(payload.get("clearance_mm", 1.0)),
+                    "assembly_translation_step_mm": float(
+                        payload.get("assembly_translation_step_mm", 75.0)
+                    ),
+                    "assembly_rotation_step_deg": float(
+                        payload.get("assembly_rotation_step_deg", 7.5)
+                    ),
+                    "preview_without_collision": True,
+                },
+            )
+            mesh_groups["paths"] = preview_paths.get("paths", [])
+            mesh_groups["initial_preparation"] = preview_paths.get("initial_preparation")
+            mesh_groups["final_restore"] = preview_paths.get("final_restore")
+            mesh_groups["path_summary"] = preview_paths.get("summary", {})
+            response["mesh_groups"] = mesh_groups
         return response
     except HTTPException:
         raise
